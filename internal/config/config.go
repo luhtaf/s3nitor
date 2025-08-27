@@ -15,6 +15,7 @@ type Config struct {
 	EnableYara    bool
 	IOCPath       string
 	YARAPath      string
+	YARACmd       string
 	OTXAPIKey     string
 	S3Bucket      string
 	S3Prefix      string
@@ -43,6 +44,7 @@ func Load() *Config {
 		EnableYara:    os.Getenv("ENABLE_YARA") == "true",
 		IOCPath:       getOrDefault("IOC_PATH", "rules/ioc/"),
 		YARAPath:      getOrDefault("YARA_PATH", "rules/yara/"),
+		YARACmd:       getOrDefault("YARA_CMD", "yara"),
 		OTXAPIKey:     os.Getenv("OTX_API_KEY"),
 		S3Bucket:      os.Getenv("S3_BUCKET"),
 		S3Prefix:      os.Getenv("S3_PREFIX"),

@@ -37,14 +37,14 @@ func UpsertFileRecord(db *gorm.DB, record *FileRecord) error {
 		return tx.Error
 	}
 
-	// kalau ETag & LastModified sama → skip update
-	if existing.ETag == record.ETag && existing.LastModified.Equal(record.LastModified) {
+	// kalau ETag & UpdatedAt sama → skip update
+	if existing.ETag == record.ETag && existing.UpdatedAt.Equal(record.UpdatedAt) {
 		return nil
 	}
 
 	// file berubah → update metadata aja
 	existing.ETag = record.ETag
-	existing.LastModified = record.LastModified
+	existing.UpdatedAt = record.UpdatedAt
 	return db.Save(&existing).Error
 }
 

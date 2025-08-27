@@ -32,6 +32,9 @@ S3 Bucket → S3 Fetcher → Worker Pool → Scanner Engine → Reporter
 
 - Go 1.21 or higher
 - Access to S3 bucket
+- YARA executable installed in system PATH (optional, for malware detection)
+  - Download from: https://github.com/VirusTotal/yara/releases
+  - Or install via package manager: `apt install yara`, `brew install yara`, etc.
 - Optional: Elasticsearch, Loki, or Prometheus for reporting
 
 ## Dependencies
@@ -40,7 +43,7 @@ The project uses the following main dependencies:
 
 - **AWS SDK v2**: For S3 operations (`github.com/aws/aws-sdk-go-v2`)
 - **GORM**: Database ORM with support for SQLite, MySQL, and PostgreSQL
-- **YARA**: Malware pattern matching (`github.com/hillu/go-yara/v4`)
+- **YARA**: Malware pattern matching (requires YARA executable in system PATH)
 - **Godotenv**: Environment variable loading (`github.com/joho/godotenv`)
 
 All dependencies are automatically managed by Go modules.
@@ -86,6 +89,8 @@ cp env.example .env
 | `ENABLE_OTX` | Enable OTX scanner | `true` | No |
 | `ENABLE_IOC` | Enable IOC scanner | `true` | No |
 | `ENABLE_YARA` | Enable YARA scanner | `true` | No |
+| `YARA_PATH` | Path to YARA rules directory | `rules/yara/` | No |
+| `YARA_CMD` | YARA executable command/path | `yara` | No |
 | `IOC_PATH` | Path to IOC rules | `rules/ioc/` | No |
 | `S3_BUCKET` | S3 bucket name | - | **Yes** |
 | `S3_PREFIX` | S3 object prefix filter | - | No |
@@ -109,7 +114,43 @@ Place your IOC files in the `rules/ioc/` directory:
 - `sha256.txt` - SHA256 hashes (one per line)
 
 #### YARA Scanner
-Add your YARA rules to the appropriate directory (implementation dependent).
+Place your YARA rule files (`.yar`) in the `rules/yara/` directory. The scanner will automatically detect and use all `.yar` files found in this directory.
+
+**YARA Installation Options:**
+
+1. **System Installation** (Recommended):
+   ```bash
+   # Ubuntu/Debian
+   sudo apt install yara
+   
+   # macOS
+   brew install yara
+   
+   # Windows
+   # Download from https://github.com/VirusTotal/yara/releases
+   ```
+   Then use default `YARA_CMD=yara` in your `.env` file.
+
+2. **Portable YARA**:
+   If you have a portable YARA executable, specify the full path:
+   ```bash
+   # Example for portable YARA
+   YARA_CMD=/path/to/portable/yara.exe
+   YARA_CMD=./tools/yara-linux
+   YARA_CMD=C:\tools\yara.exe
+   ```
+
+Example YARA rule:
+```yara
+rule suspicious_pe {
+    meta:
+        description = "Detects suspicious PE files"
+    strings:
+        $s1 = "This program cannot be run in DOS mode"
+    condition:
+        $s1
+}
+```
 
 ## Usage
 
@@ -187,6 +228,19 @@ go run cmd/s3scanner/main.go
 ### Custom Worker Count
 ```bash
 export WORKER_COUNT=8
+go run cmd/s3scanner/main.go
+```
+
+### Using Portable YARA
+```bash
+# If you have YARA in a custom location
+export YARA_CMD=/opt/yara/bin/yara
+export YARA_PATH=/opt/yara/rules/
+go run cmd/s3scanner/main.go
+
+# Or for Windows with portable YARA
+export YARA_CMD=C:\tools\yara.exe
+export YARA_PATH=C:\tools\rules\
 go run cmd/s3scanner/main.go
 ```
 
@@ -290,11 +344,70 @@ go run cmd/s3scanner/main.go > s3scanner.log 2>&1
 
 ## Contributing
 
+We welcome contributions! Here's how you can help improve this project:
+
+### Adding New Scanners
+
+1. **Create a new scanner file** in `internal/scanner/` (e.g., `clamav_scanner.go`)
+2. **Implement the Scanner interface**:
+   ```go
+   type Scanner interface {
+       Name() string
+       Enabled() bool
+       Scan(ctx context.Context, sc *ScanContext) error
+   }
+   ```
+3. **Add configuration** in `internal/config/config.go`
+4. **Register the scanner** in the engine factory
+5. **Add tests** for your scanner
+6. **Update documentation** in README.md
+
+### Adding New Reporters
+
+1. **Create a new reporter file** in `internal/reporter/` (e.g., `slack_reporter.go`)
+2. **Implement the Reporter interface**:
+   ```go
+   type Reporter interface {
+       Report(ctx context.Context, sc *scanner.ScanContext) error
+   }
+   ```
+3. **Add configuration** in `internal/config/config.go`
+4. **Register the reporter** in the factory
+5. **Add tests** for your reporter
+6. **Update documentation** in README.md
+
+### General Contribution Steps
+
 1. Fork the repository
-2. Create a feature branch
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
 3. Make your changes
-4. Add tests
-5. Submit a pull request
+4. Add tests for new functionality
+5. Ensure all tests pass (`go test ./...`)
+6. Format your code (`go fmt ./...`)
+7. Submit a pull request
+
+### Contribution Ideas
+
+**Scanners:**
+- ClamAV integration
+- VirusTotal API scanner
+- Custom regex pattern scanner
+- File type detection scanner
+- Entropy analysis scanner
+
+**Reporters:**
+- Slack/Discord webhook reporter
+- Email notification reporter
+- JIRA ticket creation reporter
+- Custom webhook reporter
+- Syslog reporter
+
+**Other Improvements:**
+- Performance optimizations
+- Better error handling
+- Additional configuration options
+- Documentation improvements
+- Docker improvements
 
 ## License
 

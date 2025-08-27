@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/luhtaf/s3nitor/internal/config"
+	"github.com/luhtaf/s3nitor/internal/scanner"
 )
 
 // PrometheusReporter push metrics ke Prometheus
@@ -25,9 +26,9 @@ func NewPrometheusReporter(cfg *config.Config) (*PrometheusReporter, error) {
 	}, nil
 }
 
-func (r *PrometheusReporter) Report(ctx context.Context, data map[string]interface{}) error {
+func (r *PrometheusReporter) Report(ctx context.Context, sc *scanner.ScanContext) error {
 	// Convert scan results to Prometheus metrics
-	_ = r.convertToMetrics(data)
+	_ = r.convertToMetrics(sc)
 
 	// For simplicity, we'll use a basic HTTP endpoint
 	// In production, you might want to use a proper Prometheus client
@@ -50,7 +51,7 @@ func (r *PrometheusReporter) Report(ctx context.Context, data map[string]interfa
 	return nil
 }
 
-func (r *PrometheusReporter) convertToMetrics(data map[string]interface{}) string {
+func (r *PrometheusReporter) convertToMetrics(sc *scanner.ScanContext) string {
 	// Convert scan results to Prometheus format
 	// This is a simplified implementation
 	metrics := ""
@@ -60,12 +61,22 @@ func (r *PrometheusReporter) convertToMetrics(data map[string]interface{}) strin
 	metrics += "# TYPE s3_scanner_files_total counter\n"
 	metrics += fmt.Sprintf("s3_scanner_files_total %d\n", time.Now().Unix())
 
-	// Count malware detections
-	if malware, ok := data["malware_detected"]; ok {
-		if detected, ok := malware.(bool); ok && detected {
-			metrics += "# HELP s3_scanner_malware_detected Malware detection count\n"
-			metrics += "# TYPE s3_scanner_malware_detected counter\n"
-			metrics += "s3_scanner_malware_detected 1\n"
+	// Add file size metric
+	metrics += "# HELP s3_scanner_file_size_bytes File size in bytes\n"
+	metrics += "# TYPE s3_scanner_file_size_bytes gauge\n"
+	metrics += fmt.Sprintf("s3_scanner_file_size_bytes{bucket=\"%s\",key=\"%s\"} %d\n",
+		sc.Bucket, sc.Key, sc.Size)
+
+	// Count malware detections from results
+	for scannerName, result := range sc.Results {
+		if resultMap, ok := result.(map[string]interface{}); ok {
+			if match, ok := resultMap["ioc_match"]; ok {
+				if detected, ok := match.(bool); ok && detected {
+					metrics += fmt.Sprintf("# HELP s3_scanner_%s_detected %s detection count\n", scannerName, scannerName)
+					metrics += fmt.Sprintf("# TYPE s3_scanner_%s_detected counter\n", scannerName)
+					metrics += fmt.Sprintf("s3_scanner_%s_detected 1\n", scannerName)
+				}
+			}
 		}
 	}
 

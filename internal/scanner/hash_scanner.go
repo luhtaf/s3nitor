@@ -25,10 +25,10 @@ func (h *HashScanner) Name() string  { return "hash_scanner" }
 func (h *HashScanner) Enabled() bool { return h.enabled }
 
 // Scan menghitung hash file dan menyimpan di ScanContext
-func (h *HashScanner) Scan(ctx context.Context, sc *ScanContext) (map[string]interface{}, error) {
+func (h *HashScanner) Scan(ctx context.Context, sc *ScanContext) error {
 	file, err := os.Open(sc.FilePath)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer file.Close()
 
@@ -37,7 +37,7 @@ func (h *HashScanner) Scan(ctx context.Context, sc *ScanContext) (map[string]int
 	sha256h := sha256.New()
 
 	if _, err := io.Copy(io.MultiWriter(md5h, sha1h, sha256h), file); err != nil {
-		return nil, err
+		return err
 	}
 
 	// Encode ke hex string
@@ -63,5 +63,5 @@ func (h *HashScanner) Scan(ctx context.Context, sc *ScanContext) (map[string]int
 	log.Printf("[%s] scanned file %s: md5=%s sha1=%s sha256=%s",
 		h.Name(), sc.FilePath, md5Str, sha1Str, sha256Str)
 
-	return sc.Hashes, nil
+	return nil
 }

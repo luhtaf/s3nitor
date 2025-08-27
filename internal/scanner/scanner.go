@@ -5,26 +5,8 @@ import (
 	"log"
 
 	"github.com/luhtaf/s3nitor/internal/config"
+	"github.com/luhtaf/s3nitor/internal/s3fetcher"
 )
-
-// Scanner interface → semua scanner wajib implementasi ini
-type Scanner interface {
-	Name() string
-	Scan(ctx context.Context, sc *ScanContext) error
-	Enabled() bool
-}
-
-// Engine → orchestrator untuk semua scanner
-type Engine struct {
-	scanners []Scanner
-}
-
-// ScanContext → data yang dishare antar scanner
-type ScanContext struct {
-	FilePath string
-	Hashes   map[string]string      // md5, sha1, sha256
-	Results  map[string]interface{} // hasil semua scanner
-}
 
 // NewEngine build engine & register scanner sesuai config
 func NewEngine(cfg *config.Config) *Engine {
@@ -54,10 +36,12 @@ func (e *Engine) Run(ctx context.Context) error {
 	return nil
 }
 
-// ProcessFile → scan 1 file lewat semua scanner
-func (e *Engine) ProcessFile(ctx context.Context, filePath string) error {
+func (e *Engine) ProcessFile(ctx context.Context, obj s3fetcher.S3Object, localPath string) (*ScanContext, error) {
 	sc := &ScanContext{
-		FilePath: filePath,
+		Bucket:   obj.Bucket,
+		Key:      obj.Key,
+		Size:     obj.Size,
+		FilePath: localPath,
 		Results:  make(map[string]interface{}),
 	}
 
@@ -70,10 +54,5 @@ func (e *Engine) ProcessFile(ctx context.Context, filePath string) error {
 		}
 	}
 
-	// setelah semua scanner jalan → output
-	if err := WriteOutput(sc); err != nil {
-		return err
-	}
-
-	return nil
+	return sc, nil
 }

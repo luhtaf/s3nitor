@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/luhtaf/s3nitor/internal/config"
+	"github.com/luhtaf/s3nitor/internal/scanner"
 )
 
 // JSONReporter output ke stdout atau file
@@ -18,8 +20,18 @@ func NewJSONReporter(cfg *config.Config) (*JSONReporter, error) {
 	return &JSONReporter{outputFile: cfg.ReporterPath}, nil
 }
 
-func (r *JSONReporter) Report(ctx context.Context, data map[string]interface{}) error {
-	b, err := json.MarshalIndent(data, "", "  ")
+func (r *JSONReporter) Report(ctx context.Context, sc *scanner.ScanContext) error {
+	// Create enriched data with metadata
+	enrichedData := map[string]interface{}{
+		"bucket":    sc.Bucket,
+		"key":       sc.Key,
+		"size":      sc.Size,
+		"hashes":    sc.Hashes,
+		"scan_time": time.Now().Format(time.RFC3339),
+		"results":   sc.Results,
+	}
+
+	b, err := json.MarshalIndent(enrichedData, "", "  ")
 	if err != nil {
 		return err
 	}

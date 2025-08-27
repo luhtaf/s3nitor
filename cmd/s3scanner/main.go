@@ -17,12 +17,6 @@ import (
 	"github.com/luhtaf/s3nitor/internal/scanner"
 )
 
-type job struct {
-	Key          string
-	ETag         string
-	LastModified time.Time
-}
-
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -63,18 +57,18 @@ func main() {
 	}
 
 	// Init S3 fetcher
-	fetcher, err := s3fetcher.New(cfg)
+	fetcher, err := s3fetcher.NewS3Fetcher(cfg)
 	if err != nil {
 		log.Fatalf("failed init s3 fetcher: %v", err)
 	}
 
 	// List metadata S3 objects
-	objects, err := fetcher.ListObjects(ctx, cfg.S3Bucket, cfg.S3Prefix)
+	objects, err := fetcher.ListObjects(ctx)
 	if err != nil {
 		log.Fatalf("failed list s3 objects: %v", err)
 	}
 
-	jobs := make(chan job, len(objects))
+	jobs := make(chan s3fetcher.S3Object, len(objects))
 	wg := &sync.WaitGroup{}
 
 	// Worker pool
@@ -100,14 +94,14 @@ func main() {
 				}
 
 				// Download file S3
-				localPath, err := fetcher.Download(ctx, cfg.S3Bucket, j.Key)
+				localPath, err := fetcher.Download(ctx, j.Key)
 				if err != nil {
 					log.Printf("[worker %d] download error: %v", id, err)
 					continue
 				}
 
 				// Scan file → hasilnya dikirim ke reporter
-				results, err := engine.ProcessFile(ctx, localPath)
+				results, err := engine.ProcessFile(ctx, j, localPath)
 				if err != nil {
 					log.Printf("[worker %d] scan error: %v", id, err)
 				} else {
@@ -133,11 +127,7 @@ func main() {
 
 	// Feed jobs
 	for _, obj := range objects {
-		jobs <- job{
-			Key:          obj.Key,
-			ETag:         obj.ETag,
-			LastModified: obj.LastModified,
-		}
+		jobs <- obj
 	}
 	close(jobs)
 

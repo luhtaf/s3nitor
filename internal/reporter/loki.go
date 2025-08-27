@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/luhtaf/s3nitor/internal/config"
+	"github.com/luhtaf/s3nitor/internal/scanner"
 )
 
 // LokiReporter push ke Loki
@@ -27,7 +28,11 @@ func NewLokiReporter(cfg *config.Config) (*LokiReporter, error) {
 	}, nil
 }
 
-func (r *LokiReporter) Report(ctx context.Context, data map[string]interface{}) error {
+func (r *LokiReporter) Report(ctx context.Context, sc *scanner.ScanContext) error {
+	// Create enriched log message with metadata
+	logMessage := fmt.Sprintf("bucket=%s key=%s size=%d hashes=%v results=%v",
+		sc.Bucket, sc.Key, sc.Size, sc.Hashes, sc.Results)
+
 	// Loki expects a specific format
 	lokiData := map[string]interface{}{
 		"streams": []map[string]interface{}{
@@ -38,7 +43,7 @@ func (r *LokiReporter) Report(ctx context.Context, data map[string]interface{}) 
 				"values": [][]string{
 					{
 						fmt.Sprintf("%d", time.Now().UnixNano()),
-						fmt.Sprintf("%v", data),
+						logMessage,
 					},
 				},
 			},

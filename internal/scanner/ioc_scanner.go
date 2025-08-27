@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/luhtaf/s3nitor/internal/config"
 )
 
 // IOCScanner memeriksa hash file terhadap IOC (md5, sha1, sha256)
@@ -20,7 +22,7 @@ type IOCScanner struct {
 }
 
 // NewIOCScanner inisialisasi scanner dengan Config
-func NewIOCScanner(cfg *Config) *IOCScanner {
+func NewIOCScanner(cfg *config.Config) *IOCScanner {
 	i := &IOCScanner{
 		md5Set:    make(map[string]bool),
 		sha1Set:   make(map[string]bool),
@@ -53,9 +55,9 @@ func (i *IOCScanner) Name() string { return "ioc_scanner" }
 func (i *IOCScanner) Enabled() bool { return i.enabled }
 
 // Scan per file
-func (i *IOCScanner) Scan(ctx context.Context, sc *ScanContext) (map[string]interface{}, error) {
+func (i *IOCScanner) Scan(ctx context.Context, sc *ScanContext) error {
 	if sc.Hashes == nil || (sc.Hashes["md5"] == "" && sc.Hashes["sha1"] == "" && sc.Hashes["sha256"] == "") {
-		return nil, fmt.Errorf("IOCScanner: no hash data in ScanContext")
+		return fmt.Errorf("IOCScanner: no hash data in ScanContext")
 	}
 
 	matches := []string{}
@@ -76,7 +78,7 @@ func (i *IOCScanner) Scan(ctx context.Context, sc *ScanContext) (map[string]inte
 
 	// simpan ke ScanContext
 	sc.Results[i.Name()] = results
-	return results, nil
+	return nil
 }
 
 // loadFile baca IOC file ke map

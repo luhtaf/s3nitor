@@ -7,6 +7,8 @@ import (
 	"log"
 	"net/http"
 	"time"
+
+	"github.com/luhtaf/s3nitor/internal/config"
 )
 
 // OTXScanner cek file hash via AlienVault OTX API
@@ -17,7 +19,7 @@ type OTXScanner struct {
 }
 
 // NewOTXScanner inisialisasi scanner dengan Config
-func NewOTXScanner(cfg *Config) *OTXScanner {
+func NewOTXScanner(cfg *config.Config) *OTXScanner {
 	return &OTXScanner{
 		enabled: cfg.EnableOTX && cfg.S3Endpoint != "",
 		apiKey:  cfg.OTXAPIKey, // tambahkan field OTXAPIKey di Config
@@ -31,33 +33,33 @@ func (o *OTXScanner) Name() string  { return "otx_scanner" }
 func (o *OTXScanner) Enabled() bool { return o.enabled && o.apiKey != "" }
 
 // Scan file via OTX API (hash dari ScanContext)
-func (o *OTXScanner) Scan(ctx context.Context, sc *ScanContext) (map[string]interface{}, error) {
+func (o *OTXScanner) Scan(ctx context.Context, sc *ScanContext) error {
 	sha256 := sc.Hashes["sha256"]
 	if sha256 == "" {
-		return nil, fmt.Errorf("OTXScanner: no SHA256 hash in ScanContext")
+		return fmt.Errorf("OTXScanner: no SHA256 hash in ScanContext")
 	}
 
 	url := fmt.Sprintf("https://otx.alienvault.com/api/v1/indicators/file/%s", sha256)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	req.Header.Set("X-OTX-API-KEY", o.apiKey)
 
 	resp, err := o.client.Do(req)
 	if err != nil {
 		log.Printf("[%s] error: %v", o.Name(), err)
-		return nil, err
+		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("OTXScanner: status code %d", resp.StatusCode)
+		return fmt.Errorf("OTXScanner: status code %d", resp.StatusCode)
 	}
 
 	var data map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return nil, err
+		return err
 	}
 
 	results := map[string]interface{}{
@@ -66,5 +68,5 @@ func (o *OTXScanner) Scan(ctx context.Context, sc *ScanContext) (map[string]inte
 	}
 
 	sc.Results[o.Name()] = results
-	return results, nil
+	return nil
 }
