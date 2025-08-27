@@ -1,10 +1,10 @@
-# S3 Scanner
+# S3 Compatible Scanner
 
-A high-performance Go application for scanning S3 buckets for malicious content using modular scanners and flexible reporting systems.
+A high-performance Go application for scanning S3-compatible storage (AWS S3, MinIO, DigitalOcean Spaces, etc.) for malicious content using modular scanners and flexible reporting systems.
 
 ## Features
 
-- **S3 Integration**: Scan files directly from S3 buckets with efficient downloading
+- **S3 Compatible Storage**: Scan files directly from S3-compatible storage (AWS S3, MinIO, DigitalOcean Spaces, etc.) with efficient downloading
 - **Modular Scanners**: Support for multiple scanning engines:
   - **OTX Scanner**: AlienVault Open Threat Exchange integration
   - **IOC Scanner**: Indicator of Compromise detection (MD5, SHA1, SHA256)
@@ -21,17 +21,17 @@ A high-performance Go application for scanning S3 buckets for malicious content 
 ## Architecture
 
 ```
-S3 Bucket → S3 Fetcher → Worker Pool → Scanner Engine → Reporter
-                ↓              ↓            ↓            ↓
-            List Objects   Download    Process File   Send Results
-                ↓              ↓            ↓            ↓
-            Metadata      Local Temp   Scan Results   Various Outputs
+S3-Compatible Storage → S3 Fetcher → Worker Pool → Scanner Engine → Reporter
+        ↓                      ↓              ↓            ↓            ↓
+    List Objects          Download    Process File   Send Results
+        ↓                      ↓              ↓            ↓            ↓
+    Metadata              Local Temp   Scan Results   Various Outputs
 ```
 
 ## Prerequisites
 
 - Go 1.21 or higher
-- Access to S3 bucket
+- Access to S3-compatible storage (AWS S3, MinIO, DigitalOcean Spaces, etc.)
 - YARA executable installed in system PATH (optional, for malware detection)
   - Download from: https://github.com/VirusTotal/yara/releases
   - Or install via package manager: `apt install yara`, `brew install yara`, etc.
@@ -92,11 +92,11 @@ cp env.example .env
 | `YARA_PATH` | Path to YARA rules directory | `rules/yara/` | No |
 | `YARA_CMD` | YARA executable command/path | `yara` | No |
 | `IOC_PATH` | Path to IOC rules | `rules/ioc/` | No |
-| `S3_BUCKET` | S3 bucket name | - | **Yes** |
+| `S3_BUCKET` | S3-compatible bucket/container name | - | **Yes** |
 | `S3_PREFIX` | S3 object prefix filter | - | No |
-| `S3_ACCESS_KEY` | AWS access key | - | **Yes** |
-| `S3_SECRET_KEY` | AWS secret key | - | **Yes** |
-| `S3_ENDPOINT` | S3 endpoint URL | `https://s3.amazonaws.com` | No |
+| `S3_ACCESS_KEY` | S3-compatible access key | - | **Yes** |
+| `S3_SECRET_KEY` | S3-compatible secret key | - | **Yes** |
+| `S3_ENDPOINT` | S3-compatible endpoint URL | `https://s3.amazonaws.com` | No |
 | `WORKER_COUNT` | Number of worker goroutines | `0` (auto-detect) | No |
 | `REPORTER_TYPE` | Output format | `json` | No |
 | `REPORTER_PATH` | Output file path (for JSON) | `./scan-results.json` | No |
@@ -225,6 +225,40 @@ export S3_PREFIX=uploads/
 go run cmd/s3scanner/main.go
 ```
 
+### Using Different S3-Compatible Storage
+
+**AWS S3:**
+```bash
+export S3_ENDPOINT=https://s3.amazonaws.com
+export S3_BUCKET=my-bucket
+export S3_ACCESS_KEY=your-aws-access-key
+export S3_SECRET_KEY=your-aws-secret-key
+```
+
+**MinIO:**
+```bash
+export S3_ENDPOINT=http://localhost:9000
+export S3_BUCKET=my-bucket
+export S3_ACCESS_KEY=your-minio-access-key
+export S3_SECRET_KEY=your-minio-secret-key
+```
+
+**DigitalOcean Spaces:**
+```bash
+export S3_ENDPOINT=https://nyc3.digitaloceanspaces.com
+export S3_BUCKET=my-space
+export S3_ACCESS_KEY=your-do-access-key
+export S3_SECRET_KEY=your-do-secret-key
+```
+
+**Backblaze B2:**
+```bash
+export S3_ENDPOINT=https://s3.us-west-002.backblazeb2.com
+export S3_BUCKET=my-bucket
+export S3_ACCESS_KEY=your-b2-key-id
+export S3_SECRET_KEY=your-b2-application-key
+```
+
 ### Custom Worker Count
 ```bash
 export WORKER_COUNT=8
@@ -314,13 +348,13 @@ go fmt ./...
 ## Performance Considerations
 
 - **Worker Count**: Set `WORKER_COUNT` based on your CPU cores and network bandwidth
-- **S3 Prefix**: Use prefixes to limit scan scope
+- **S3 Prefix**: Use prefixes to limit scan scope across S3-compatible storage
 - **Database**: Consider using a more robust database for production (PostgreSQL, MySQL)
 - **Memory**: Large files are downloaded temporarily - ensure sufficient disk space
 
 ## Security Considerations
 
-- Store AWS credentials securely (use IAM roles when possible)
+- Store S3-compatible credentials securely (use IAM roles when possible for AWS S3)
 - Regularly update IOC and YARA rules
 - Monitor scan results for false positives
 - Implement proper access controls for reporting systems
@@ -329,7 +363,7 @@ go fmt ./...
 
 ### Common Issues
 
-1. **S3 Access Denied**: Check AWS credentials and bucket permissions
+1. **S3 Access Denied**: Check S3-compatible credentials and bucket permissions
 2. **Scanner Errors**: Verify rule files exist and are properly formatted
 3. **Reporter Failures**: Check network connectivity to reporting systems
 4. **Memory Issues**: Reduce worker count or implement file size limits
