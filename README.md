@@ -52,8 +52,8 @@ All dependencies are automatically managed by Go modules.
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
-cd s3-gpt
+git clone https://github.com/luhtaf/s3nitor
+cd s3nitor
 ```
 
 2. Install dependencies:
@@ -281,7 +281,7 @@ go run cmd/s3scanner/main.go
 ## Project Structure
 
 ```
-s3-gpt/
+s3nitor/
 ├── cmd/
 │   └── s3scanner/
 │       └── main.go          # Application entry point
