@@ -386,7 +386,7 @@ We welcome contributions! Here's how you can help improve this project:
 6. Format your code (`go fmt ./...`)
 7. Submit a pull request
 
-### Contribution Ideas
+### Future Works / Contribution Ideas
 
 **Scanners:**
 - ClamAV integration
@@ -394,6 +394,8 @@ We welcome contributions! Here's how you can help improve this project:
 - Custom regex pattern scanner
 - File type detection scanner
 - Entropy analysis scanner
+- MISP API Scanner
+- OpenCTI API Scanner
 
 **Reporters:**
 - Slack/Discord webhook reporter
@@ -409,10 +411,6 @@ We welcome contributions! Here's how you can help improve this project:
 - Documentation improvements
 - Docker improvements
 
-## License
-
-[Add your license information here]
-
 ## Support
 
-For issues and questions, please open an issue on the repository.
+For issues and questions, please open an issue on the repository or you can contact me by email
