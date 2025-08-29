@@ -457,12 +457,6 @@ We welcome contributions! Here's how you can help:
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 🆘 Support
-
-- **Issues**: [GitHub Issues](https://github.com/luhtaf/s3nitor/issues)
-- **Documentation**: [Wiki](https://github.com/luhtaf/s3nitor/wiki)
-- **Email**: Contact maintainer directly
-
 ---
 
-**Made with ❤️ by the S3-GPT Scanner Team**
+**Made with ❤️ by Luhtaf**
