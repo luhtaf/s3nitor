@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`s3nitor` (module `github.com/luhtaf/s3nitor`, binary `s3scanner`) scans S3-compatible object storage for malicious content. Go 1.21, no test files exist yet.
+`s3nitor` (module `github.com/luhtaf/s3nitor`, binary `s3scanner`) scans S3-compatible object storage for malicious content. Go 1.25 (floor set by `pgx v5.10`, upgraded for its CVEs). No Go test files exist yet — the shell suites under `test/integration/` need a live cluster.
 
 Code comments and log messages are a mix of Indonesian and English — match the surrounding file rather than normalizing.
 
