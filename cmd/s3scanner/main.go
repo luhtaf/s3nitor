@@ -17,7 +17,12 @@ import (
 	"github.com/luhtaf/s3nitor/internal/scanner"
 )
 
+// Version diisi saat build via -ldflags "-X main.Version=..."
+var Version = "dev"
+
 func main() {
+	log.Printf("s3nitor %s starting", Version)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

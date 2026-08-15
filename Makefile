@@ -77,13 +77,18 @@ docker-run:
 	@echo "Running Docker container..."
 	docker run --env-file .env $(DOCKER_IMAGE)
 
-# Create release build
+# Build a release binary for the HOST platform only.
+#
+# Do NOT cross-compile this project with plain `GOOS=... go build`: Go silently
+# sets CGO_ENABLED=0 when the target differs from the host, and mattn/go-sqlite3
+# then compiles to a stub that panics at startup with
+#   "Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work".
+# The build succeeds, the binary is broken. Multi-platform artifacts are built
+# natively per-OS by .github/workflows/release.yml — push a v* tag instead.
 release: clean
-	@echo "Creating release build..."
+	@echo "Creating release build for host platform ($(shell go env GOOS)/$(shell go env GOARCH))..."
 	mkdir -p $(BUILD_DIR)
-	GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 ./cmd/s3scanner
-	GOOS=darwin GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-amd64 ./cmd/s3scanner
-	GOOS=windows GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-windows-amd64.exe ./cmd/s3scanner
+	CGO_ENABLED=1 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-$(shell go env GOOS)-$(shell go env GOARCH) ./cmd/s3scanner
 
 # Show help
 help:

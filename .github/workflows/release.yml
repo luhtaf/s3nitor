@@ -1,0 +1,126 @@
+name: release
+
+# Tag a version to cut a release:  git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built natively per-OS on purpose: the sqlite3 driver needs cgo, and
+          # cross-compiling silently disables it, producing binaries that panic
+          # at startup. See the `release` target in the Makefile.
+          - { runner: ubuntu-latest,  goos: linux,   goarch: amd64 }
+          - { runner: macos-latest,   goos: darwin,  goarch: arm64 }
+          - { runner: macos-latest,   goos: darwin,  goarch: amd64 }
+          - { runner: windows-latest, goos: windows, goarch: amd64 }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Build
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          name="s3scanner-${GOOS}-${GOARCH}"
+          bin="$name"
+          [ "$GOOS" = "windows" ] && bin="$name.exe"
+
+          go build -trimpath -ldflags "-s -w -X main.Version=$version" -o "dist/$bin" ./cmd/s3scanner
+
+      - name: Verify the binary runs with a real sqlite DB
+        # Guards the exact failure mode that motivated this workflow: a binary
+        # that builds fine but cannot open its default database. Skipped when
+        # the artifact cannot execute on the runner (darwin/amd64 on arm64).
+        if: matrix.goos != 'windows' && !(matrix.goos == 'darwin' && matrix.goarch == 'amd64')
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Point S3 at a dead local port so the run fails fast right after the
+          # DB opens, and keep the AWS SDK off the instance-metadata endpoint.
+          out=$(DB_DRIVER=sqlite3 DB_DSN="$RUNNER_TEMP/smoke.db" \
+                S3_BUCKET=smoke S3_ENDPOINT="http://127.0.0.1:1" \
+                S3_ACCESS_KEY=x S3_SECRET_KEY=x \
+                AWS_EC2_METADATA_DISABLED=true AWS_REGION=us-east-1 \
+                "dist/s3scanner-${{ matrix.goos }}-${{ matrix.goarch }}" 2>&1 || true)
+          echo "$out"
+          if grep -q "CGO_ENABLED=0" <<<"$out"; then
+            echo "::error::binary was built without cgo — sqlite3 driver is a stub"
+            exit 1
+          fi
+          if grep -q "failed init DB" <<<"$out"; then
+            echo "::error::binary cannot open its database"
+            exit 1
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="s3scanner-${{ matrix.goos }}-${{ matrix.goarch }}"
+          # Ship the rule directories: the scanners read them from disk at runtime.
+          mkdir -p "staging/$name"
+          cp -r rules "staging/$name/"
+          cp env.example README.md "staging/$name/"
+          cp dist/* "staging/$name/"
+
+          cd staging
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            7z a "../$name.zip" "$name" >/dev/null
+          else
+            tar -czf "../$name.tar.gz" "$name"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: s3scanner-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            *.tar.gz
+            *.zip
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum ./*.tar.gz ./*.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            artifacts/*
