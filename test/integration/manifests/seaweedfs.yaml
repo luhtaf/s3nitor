@@ -1,0 +1,122 @@
+# SeaweedFS buat Fase 0 — opsional, dipisah dari test-stack.yaml karena cuma
+# dipakai skrip seaweedfs-kafka.sh.
+#
+# Beda mendasar dari MinIO: notifikasi SeaweedFS keluar dari lapisan FILER,
+# bukan lapisan S3. Yang dikirim itu event filesystem (path filer + entry),
+# bukan event S3 (bucket + key), dan wire-nya PROTOBUF, bukan JSON.
+#
+# Bergantung pada s3nitor-test-kafka dari test-stack.yaml — SeaweedFS nggak punya
+# target notifikasi Redis, jadi Kafka wajib di sini.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: s3nitor-test-seaweedfs-config
+  labels:
+    app.kubernetes.io/part-of: s3nitor-test
+data:
+  # weed nyari filer.toml di ./, $HOME/.seaweedfs/, lalu /etc/seaweedfs/
+  #
+  # Begitu filer.toml disediakan, filer BERHENTI pakai store default dan cuma
+  # pakai apa yang tertulis di sini. Tanpa section store yang enabled, filer
+  # nyetak daftar store yang tersedia lalu mati exit 255 — jadi leveldb2 wajib
+  # ditulis eksplisit walaupun itu memang defaultnya.
+  filer.toml: |
+    [leveldb2]
+    enabled = true
+    dir = "/data/filerldb2"
+
+    [notification.kafka]
+    enabled = true
+    hosts = ["s3nitor-test-kafka:9092"]
+    topic = "seaweedfs_filer"
+    offsetFile = "/data/kafka.offset"
+    offsetSaveIntervalSeconds = 10
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3nitor-test-seaweedfs
+  labels:
+    app.kubernetes.io/name: s3nitor-test-seaweedfs
+    app.kubernetes.io/part-of: s3nitor-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: s3nitor-test-seaweedfs
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: s3nitor-test-seaweedfs
+        app.kubernetes.io/part-of: s3nitor-test
+    spec:
+      containers:
+        - name: seaweedfs
+          image: chrislusf/seaweedfs:3.80
+          # -ip = alamat yang DIIKLANKAN antar komponen; -ip.bind = alamat bind socket.
+          #
+          # Harus `localhost`, bukan nama service. Komponen SeaweedFS ngobrol lewat
+          # gRPC di port HTTP + 10000 (master 9333→19333, volume 8080→18080,
+          # filer 8888→18888). Kalau diiklankan sebagai nama service, trafik internal
+          # muter lewat ClusterIP — yang nggak expose port gRPC itu — dan pod-nya
+          # ngegantung dengan "dial tcp …:19333: i/o timeout" selamanya.
+          #
+          # Semua komponen ada di SATU pod, jadi loopback itu jalur yang benar.
+          # Klien luar tetap bisa masuk karena bind-nya 0.0.0.0.
+          #
+          # Harus 127.0.0.1, JANGAN `localhost`: di image ini localhost resolve
+          # ke ::1 duluan, sedangkan master bind di IPv4 — hasilnya
+          # "dial tcp [::1]:19333: connect: connection refused" berulang.
+          args:
+            - server
+            - -dir=/data
+            - -ip=127.0.0.1
+            - -ip.bind=0.0.0.0
+            - -master.volumeSizeLimitMB=64
+            - -filer
+            - -s3
+            - -s3.config=/etc/seaweedfs/s3.json
+          ports:
+            - { containerPort: 9333, name: master }
+            - { containerPort: 8080, name: volume }
+            - { containerPort: 8888, name: filer }
+            - { containerPort: 8333, name: s3 }
+          volumeMounts:
+            - { mountPath: /data, name: data }
+            - { mountPath: /etc/seaweedfs/filer.toml, name: config, subPath: filer.toml }
+            - { mountPath: /etc/seaweedfs/s3.json,    name: creds,  subPath: s3.json }
+          # tcpSocket, bukan httpGet. Filer nggak punya endpoint /status (404), dan
+          # gateway S3 balik 403 buat GET anonim — dua-duanya bikin httpGet dianggap
+          # gagal padahal servernya sehat. Kesiapan sebenarnya diverifikasi skrip
+          # lewat `mc alias set`, yang nguji jalur auth S3 sampai tuntas.
+          readinessProbe:
+            tcpSocket: { port: 8333 }
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 24
+          resources:
+            requests: { cpu: 200m, memory: 512Mi }
+            limits:   { cpu: "1",  memory: 2Gi }
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: config
+          configMap: { name: s3nitor-test-seaweedfs-config }
+        - name: creds
+          secret: { secretName: s3nitor-test-seaweedfs-creds }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3nitor-test-seaweedfs
+  labels:
+    app.kubernetes.io/part-of: s3nitor-test
+spec:
+  selector:
+    app.kubernetes.io/name: s3nitor-test-seaweedfs
+  ports:
+    - { name: master, port: 9333, targetPort: 9333 }
+    - { name: volume, port: 8080, targetPort: 8080 }
+    - { name: filer,  port: 8888, targetPort: 8888 }
+    - { name: s3,     port: 8333, targetPort: 8333 }

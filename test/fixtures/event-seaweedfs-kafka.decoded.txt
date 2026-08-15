@@ -1,0 +1,372 @@
+--- pesan 1 (176 byte) ---
+#2 message (132 byte)
+  #1 string = "0771d1920d8b825463258d365888807dab45c8a0_e8efa1528a6d4607ae385809ccceeddc"
+  #2 varint = 1
+  #4 message (35 byte)
+    #2 varint = 1786508398
+    #3 varint = 2147484159
+    #6 varint = 1786508398
+    #7 string = "application/pdf"
+  #5 message (16 byte)
+    #1 string = "key"
+    #2 string = "plain.pdf"
+#3 varint = 1
+#4 string = "/buckets/s3nitor-test/.uploads"
+#6 message (5 byte)
+  #142770237 i32 = 0x
+
+--- pesan 2 (273 byte) ---
+#2 message (155 byte)
+  #1 string = "0001_dbd645ec-b6a6-4acf-aa65-767b420757ba.part"
+  #3 message (50 byte)
+    #3 varint = 593
+    #4 varint = 1786508398985426793
+    #5 string = "QsftKu56NgjZ2UG1OCg4eg=="
+    #7 message (9 byte)
+      #1 varint = 6
+      #2 varint = 9
+      #3 i32 = 0xd4d604c4
+  #4 message (53 byte)
+    #1 varint = 593
+    #2 varint = 1786508398
+    #3 varint = 432
+    #6 varint = 1786508398
+    #7 string = "application/pdf"
+    #14 message (16 byte)
+      <panjang 702151 melebihi sisa buffer>
+#3 varint = 1
+#4 string = "/buckets/s3nitor-test/.uploads/0771d1920d8b825463258d365888807dab45c8a0_e8efa1528a6d4607ae385809ccceeddc"
+#6 message (5 byte)
+  #142770237 i32 = 0x
+
+--- pesan 3 (452 byte) ---
+#1 message (214 byte)
+  #1 string = "plain.pdf"
+  #3 message (64 byte)
+    #1 string = "3,0521654a54"
+    #3 varint = 593
+    #4 varint = 1786508251978064415
+    #5 string = "QsftKu56NgjZ2UG1OCg4eg=="
+    #7 message (9 byte)
+      #1 varint = 3
+      #2 varint = 5
+      #3 i32 = 0x544a6521
+  #4 message (35 byte)
+    #1 varint = 593
+    #2 varint = 1786508251
+    #3 varint = 504
+    #6 varint = 1786508104
+    #7 string = "application/pdf"
+  #5 message (98 byte)
+    #1 string = "X-Seaweedfs-Upload-Id"
+    #2 string = "0771d1920d8b825463258d365888807dab45c8a0_a40804d1066c4b239ad9796e281c26bf"
+#2 message (200 byte)
+  #1 string = "plain.pdf"
+  #3 message (50 byte)
+    #3 varint = 593
+    #4 varint = 1786508398985426793
+    #5 string = "QsftKu56NgjZ2UG1OCg4eg=="
+    #7 message (9 byte)
+      #1 varint = 6
+      #2 varint = 9
+      #3 i32 = 0xd4d604c4
+  #4 message (35 byte)
+    #1 varint = 593
+    #2 varint = 1786508398
+    #3 varint = 504
+    #6 varint = 1786508104
+    #7 string = "application/pdf"
+  #5 message (98 byte)
+    #1 string = "X-Seaweedfs-Upload-Id"
+    #2 string = "0771d1920d8b825463258d365888807dab45c8a0_e8efa1528a6d4607ae385809ccceeddc"
+#3 varint = 1
+#4 string = "/buckets/s3nitor-test"
+#6 message (5 byte)
+  #142770237 i32 = 0x
+
+--- pesan 4 (179 byte) ---
+#1 message (169 byte)
+  #1 string = "0001_dbd645ec-b6a6-4acf-aa65-767b420757ba.part"
+  #3 message (64 byte)
+    #1 string = "6,09c404d6d4"
+    #3 varint = 593
+    #4 varint = 1786508398985426793
+    #5 string = "QsftKu56NgjZ2UG1OCg4eg=="
+    #7 message (9 byte)
+      #1 varint = 6
+      #2 varint = 9
+      #3 i32 = 0xd4d604c4
+  #4 message (53 byte)
+    #1 varint = 593
+    #2 varint = 1786508398
+    #3 varint = 432
+    #6 varint = 1786508398
+    #7 string = "application/pdf"
+    #14 message (16 byte)
+      <panjang 702151 melebihi sisa buffer>
+#6 message (5 byte)
+  #142770237 i32 = 0x
+
+--- pesan 5 (142 byte) ---
+#1 message (132 byte)
+  #1 string = "0771d1920d8b825463258d365888807dab45c8a0_e8efa1528a6d4607ae385809ccceeddc"
+  #2 varint = 1
+  #4 message (35 byte)
+    #2 varint = 1786508398
+    #3 varint = 2147484159
+    #6 varint = 1786508398
+    #7 string = "application/pdf"
+  #5 message (16 byte)
+    #1 string = "key"
+    #2 string = "plain.pdf"
+#6 message (5 byte)
+  #142770237 i32 = 0x
+
+--- pesan 6 (181 byte) ---
+#2 message (137 byte)
+  #1 string = "a3ea5caff4b502bbba461b2ab745aa277ee6def9_5390a97bcba7439796bc7a4656699fdf"
+  #2 varint = 1
+  #4 message (35 byte)
+    #2 varint = 1786508399
+    #3 varint = 2147484159
+    #6 varint = 1786508399
+    #7 string = "application/pdf"
+  #5 message (21 byte)
+    #1 string = "key"
+    #2 string = "with space.pdf"
+#3 varint = 1
+#4 string = "/buckets/s3nitor-test/.uploads"
+#6 message (5 byte)
+  #142770237 i32 = 0x
+
+--- pesan 7 (273 byte) ---
+#2 message (155 byte)
+  #1 string = "0001_2a72196e-1df3-4871-9629-18d7f1bc5742.part"
+  #3 message (50 byte)
+    #3 varint = 593
+    #4 varint = 1786508399207590081
+    #5 string = "QsftKu56NgjZ2UG1OCg4eg=="
+    #7 message (9 byte)
+      #1 varint = 5
+      #2 varint = 10
+      #3 i32 = 0x871b9554
+  #4 message (53 byte)
+    #1 varint = 593
+    #2 varint = 1786508399
+    #3 varint = 432
+    #6 varint = 1786508399
+    #7 string = "application/pdf"
+    #14 message (16 byte)
+      <panjang 702151 melebihi sisa buffer>
+#3 varint = 1
+#4 string = "/buckets/s3nitor-test/.uploads/a3ea5caff4b502bbba461b2ab745aa277ee6def9_5390a97bcba7439796bc7a4656699fdf"
+#6 message (5 byte)
+  #142770237 i32 = 0x
+
+--- pesan 8 (462 byte) ---
+#1 message (219 byte)
+  #1 string = "with space.pdf"
+  #3 message (64 byte)
+    #1 string = "2,063c46cd48"
+    #3 varint = 593
+    #4 varint = 1786508252197461204
+    #5 string = "QsftKu56NgjZ2UG1OCg4eg=="
+    #7 message (9 byte)
+      #1 varint = 2
+      #2 varint = 6
+      #3 i32 = 0x48cd463c
+  #4 message (35 byte)
+    #1 varint = 593
+    #2 varint = 1786508252
+    #3 varint = 504
+    #6 varint = 1786508104
+    #7 string = "application/pdf"
+  #5 message (98 byte)
+    #1 string = "X-Seaweedfs-Upload-Id"
+    #2 string = "a3ea5caff4b502bbba461b2ab745aa277ee6def9_7c0cb2ee1304435696e10c6047f70a91"
+#2 message (205 byte)
+  #1 string = "with space.pdf"
+  #3 message (50 byte)
+    #3 varint = 593
+    #4 varint = 1786508399207590081
+    #5 string = "QsftKu56NgjZ2UG1OCg4eg=="
+    #7 message (9 byte)
+      #1 varint = 5
+      #2 varint = 10
+      #3 i32 = 0x871b9554
+  #4 message (35 byte)
+    #1 varint = 593
+    #2 varint = 1786508399
+    #3 varint = 504
+    #6 varint = 1786508104
+    #7 string = "application/pdf"
+  #5 message (98 byte)
+    #1 string = "X-Seaweedfs-Upload-Id"
+    #2 string = "a3ea5caff4b502bbba461b2ab745aa277ee6def9_5390a97bcba7439796bc7a4656699fdf"
+#3 varint = 1
+#4 string = "/buckets/s3nitor-test"
+#6 message (5 byte)
+  #142770237 i32 = 0x
+
+--- pesan 9 (179 byte) ---
+#1 message (169 byte)
+  #1 string = "0001_2a72196e-1df3-4871-9629-18d7f1bc5742.part"
+  #3 message (64 byte)
+    #1 string = "5,0a54951b87"
+    #3 varint = 593
+    #4 varint = 1786508399207590081
+    #5 string = "QsftKu56NgjZ2UG1OCg4eg=="
+    #7 message (9 byte)
+      #1 varint = 5
+      #2 varint = 10
+      #3 i32 = 0x871b9554
+  #4 message (53 byte)
+    #1 varint = 593
+    #2 varint = 1786508399
+    #3 varint = 432
+    #6 varint = 1786508399
+    #7 string = "application/pdf"
+    #14 message (16 byte)
+      <panjang 702151 melebihi sisa buffer>
+#6 message (5 byte)
+  #142770237 i32 = 0x
+
+--- pesan 10 (147 byte) ---
+#1 message (137 byte)
+  #1 string = "a3ea5caff4b502bbba461b2ab745aa277ee6def9_5390a97bcba7439796bc7a4656699fdf"
+  #2 varint = 1
+  #4 message (35 byte)
+    #2 varint = 1786508399
+    #3 varint = 2147484159
+    #6 varint = 1786508399
+    #7 string = "application/pdf"
+  #5 message (21 byte)
+    #1 string = "key"
+    #2 string = "with space.pdf"
+#6 message (5 byte)
+  #142770237 i32 = 0x
+
+--- pesan 11 (187 byte) ---
+#2 message (143 byte)
+  #1 string = "0e3e64fc33805c05889631eac8f64324586ae93a_b4a6b7eda356482bace5763dda2d0d49"
+  #2 varint = 1
+  #4 message (35 byte)
+    #2 varint = 1786508399
+    #3 varint = 2147484159
+    #6 varint = 1786508399
+    #7 string = "application/pdf"
+  #5 message (27 byte)
+    #1 string = "key"
+    #2 string = "nested/deep/path.pdf"
+#3 varint = 1
+#4 string = "/buckets/s3nitor-test/.uploads"
+#6 message (5 byte)
+  #142770237 i32 = 0x
+
+--- pesan 12 (273 byte) ---
+#2 message (155 byte)
+  #1 string = "0001_eabd3edc-8831-48d1-8996-0381eedf4bea.part"
+  #3 message (50 byte)
+    #3 varint = 593
+    #4 varint = 1786508399414537079
+    #5 string = "QsftKu56NgjZ2UG1OCg4eg=="
+    #7 message (9 byte)
+      #1 varint = 5
+      #2 varint = 11
+      #3 i32 = 0x22b36672
+  #4 message (53 byte)
+    #1 varint = 593
+    #2 varint = 1786508399
+    #3 varint = 432
+    #6 varint = 1786508399
+    #7 string = "application/pdf"
+    #14 message (16 byte)
+      <panjang 702151 melebihi sisa buffer>
+#3 varint = 1
+#4 string = "/buckets/s3nitor-test/.uploads/0e3e64fc33805c05889631eac8f64324586ae93a_b4a6b7eda356482bace5763dda2d0d49"
+#6 message (5 byte)
+  #142770237 i32 = 0x
+
+--- pesan 13 (462 byte) ---
+#1 message (213 byte)
+  #1 string = "path.pdf"
+  #3 message (64 byte)
+    #1 string = "2,070aceb9f5"
+    #3 varint = 593
+    #4 varint = 1786508252404052345
+    #5 string = "QsftKu56NgjZ2UG1OCg4eg=="
+    #7 message (9 byte)
+      #1 varint = 2
+      #2 varint = 7
+      #3 i32 = 0xf5b9ce0a
+  #4 message (35 byte)
+    #1 varint = 593
+    #2 varint = 1786508252
+    #3 varint = 504
+    #6 varint = 1786508104
+    #7 string = "application/pdf"
+  #5 message (98 byte)
+    #1 string = "X-Seaweedfs-Upload-Id"
+    #2 string = "0e3e64fc33805c05889631eac8f64324586ae93a_ad94d65cde104054a79abd080a7e4a60"
+#2 message (199 byte)
+  #1 string = "path.pdf"
+  #3 message (50 byte)
+    #3 varint = 593
+    #4 varint = 1786508399414537079
+    #5 string = "QsftKu56NgjZ2UG1OCg4eg=="
+    #7 message (9 byte)
+      #1 varint = 5
+      #2 varint = 11
+      #3 i32 = 0x22b36672
+  #4 message (35 byte)
+    #1 varint = 593
+    #2 varint = 1786508399
+    #3 varint = 504
+    #6 varint = 1786508104
+    #7 string = "application/pdf"
+  #5 message (98 byte)
+    #1 string = "X-Seaweedfs-Upload-Id"
+    #2 string = "0e3e64fc33805c05889631eac8f64324586ae93a_b4a6b7eda356482bace5763dda2d0d49"
+#3 varint = 1
+#4 string = "/buckets/s3nitor-test/nested/deep"
+#6 message (5 byte)
+  #142770237 i32 = 0x
+
+--- pesan 14 (179 byte) ---
+#1 message (169 byte)
+  #1 string = "0001_eabd3edc-8831-48d1-8996-0381eedf4bea.part"
+  #3 message (64 byte)
+    #1 string = "5,0b7266b322"
+    #3 varint = 593
+    #4 varint = 1786508399414537079
+    #5 string = "QsftKu56NgjZ2UG1OCg4eg=="
+    #7 message (9 byte)
+      #1 varint = 5
+      #2 varint = 11
+      #3 i32 = 0x22b36672
+  #4 message (53 byte)
+    #1 varint = 593
+    #2 varint = 1786508399
+    #3 varint = 432
+    #6 varint = 1786508399
+    #7 string = "application/pdf"
+    #14 message (16 byte)
+      <panjang 702151 melebihi sisa buffer>
+#6 message (5 byte)
+  #142770237 i32 = 0x
+
+--- pesan 15 (153 byte) ---
+#1 message (143 byte)
+  #1 string = "0e3e64fc33805c05889631eac8f64324586ae93a_b4a6b7eda356482bace5763dda2d0d49"
+  #2 varint = 1
+  #4 message (35 byte)
+    #2 varint = 1786508399
+    #3 varint = 2147484159
+    #6 varint = 1786508399
+    #7 string = "application/pdf"
+  #5 message (27 byte)
+    #1 string = "key"
+    #2 string = "nested/deep/path.pdf"
+#6 message (5 byte)
+  #142770237 i32 = 0x
+

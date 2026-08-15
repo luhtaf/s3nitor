@@ -1,0 +1,205 @@
+# Stack uji sekali-pakai buat Fase 0.
+#
+# Sengaja terpisah dari MinIO/Redis bersama di cluster: skrip ini perlu
+# nge-restart MinIO buat ngaktifin konfigurasi notifikasi, dan MinIO bersama
+# dipakai ELK. Instance sendiri berarti bebas di-restart tanpa ganggu siapapun.
+#
+# Semua penyimpanan pakai emptyDir — hilang bareng pod, memang disengaja.
+# Versi MinIO dipatok sama persis dengan yang jalan di cluster supaya hasilnya
+# mewakili keadaan sebenarnya.
+#
+# Bersihkan dengan:
+#   kubectl delete all,secret -l app.kubernetes.io/part-of=s3nitor-test -n <ns>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3nitor-test-minio
+  labels:
+    app.kubernetes.io/name: s3nitor-test-minio
+    app.kubernetes.io/part-of: s3nitor-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: s3nitor-test-minio
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: s3nitor-test-minio
+        app.kubernetes.io/part-of: s3nitor-test
+    spec:
+      containers:
+        - name: minio
+          image: quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z
+          args: ["server", "/data", "--console-address", ":9001"]
+          envFrom:
+            - secretRef:
+                name: s3nitor-test-minio-creds
+          # Target notifikasi dideklarasikan lewat env var, BUKAN lewat
+          # `mc admin config set`. Alasannya penting:
+          #
+          #   - `mc admin config set` cuma nge-STAGE nilai; baru berlaku setelah
+          #     server restart. Dan `mc admin service restart` minta /dev/tty,
+          #     jadi diam-diam gagal di bawah `kubectl exec`.
+          #   - Config disimpan di .minio.sys pada volume data. Dengan emptyDir,
+          #     restart pod = config hilang.
+          #
+          # Lewat env, target langsung hidup pas MinIO start. Deklaratif,
+          # reproducible, dan nggak ada koreografi restart sama sekali.
+          # Pola namanya: MINIO_NOTIFY_REDIS_<PARAM>_<NAMA_TARGET>
+          env:
+            - { name: MINIO_NOTIFY_REDIS_ENABLE_PRIMARY,      value: "on" }
+            - { name: MINIO_NOTIFY_REDIS_ADDRESS_PRIMARY,     value: "s3nitor-test-redis:6379" }
+            - { name: MINIO_NOTIFY_REDIS_FORMAT_PRIMARY,      value: "access" }
+            - { name: MINIO_NOTIFY_REDIS_KEY_PRIMARY,         value: "s3nitor-events" }
+            # queue_dir bikin MinIO nge-spool event ke disk kalau Redis lagi mati.
+            # Nutup outage broker; TIDAK nutup crash consumer.
+            - { name: MINIO_NOTIFY_REDIS_QUEUE_DIR_PRIMARY,   value: "/data/.s3nitor-events" }
+            - { name: MINIO_NOTIFY_REDIS_QUEUE_LIMIT_PRIMARY, value: "10000" }
+            # Target kedua: Kafka. Dua target hidup bareng supaya satu MinIO bisa
+            # melayani dua skrip uji, dan supaya amplop Redis vs Kafka bisa
+            # dibandingkan dari event yang PERSIS sama.
+            - { name: MINIO_NOTIFY_KAFKA_ENABLE_PRIMARY,      value: "on" }
+            - { name: MINIO_NOTIFY_KAFKA_BROKERS_PRIMARY,     value: "s3nitor-test-kafka:9092" }
+            - { name: MINIO_NOTIFY_KAFKA_TOPIC_PRIMARY,       value: "s3nitor-events" }
+            # queue_dir bikin MinIO nge-spool kalau Kafka belum siap pas MinIO
+            # start — k8s nggak jamin urutan pod, jadi ini yang nutup balapan itu.
+            - { name: MINIO_NOTIFY_KAFKA_QUEUE_DIR_PRIMARY,   value: "/data/.s3nitor-kafka" }
+            - { name: MINIO_NOTIFY_KAFKA_QUEUE_LIMIT_PRIMARY, value: "10000" }
+          ports:
+            - { containerPort: 9000, name: s3 }
+            - { containerPort: 9001, name: console }
+          volumeMounts:
+            - { mountPath: /data, name: data }
+          readinessProbe:
+            httpGet: { path: /minio/health/ready, port: 9000 }
+            initialDelaySeconds: 5
+            periodSeconds: 3
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { cpu: "1",  memory: 1Gi }
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3nitor-test-minio
+  labels:
+    app.kubernetes.io/part-of: s3nitor-test
+spec:
+  selector:
+    app.kubernetes.io/name: s3nitor-test-minio
+  ports:
+    - { name: s3, port: 9000, targetPort: 9000 }
+    - { name: console, port: 9001, targetPort: 9001 }
+---
+# Kafka single-node mode KRaft (tanpa ZooKeeper). Image resmi Apache, bukan
+# bitnami — bitnami baru-baru ini mindahin image lamanya ke repo `bitnamilegacy`,
+# jadi image resmi lebih aman buat skrip yang harus tetap jalan bulan depan.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3nitor-test-kafka
+  labels:
+    app.kubernetes.io/name: s3nitor-test-kafka
+    app.kubernetes.io/part-of: s3nitor-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: s3nitor-test-kafka
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: s3nitor-test-kafka
+        app.kubernetes.io/part-of: s3nitor-test
+    spec:
+      containers:
+        - name: kafka
+          image: apache/kafka:3.9.0
+          env:
+            - { name: KAFKA_NODE_ID,          value: "1" }
+            - { name: KAFKA_PROCESS_ROLES,    value: "broker,controller" }
+            - { name: KAFKA_LISTENERS,        value: "PLAINTEXT://:9092,CONTROLLER://:9093" }
+            # advertised harus nama service — MinIO dan konsumen nyambung lewat DNS cluster,
+            # bukan lewat localhost.
+            - { name: KAFKA_ADVERTISED_LISTENERS, value: "PLAINTEXT://s3nitor-test-kafka:9092" }
+            - { name: KAFKA_CONTROLLER_QUORUM_VOTERS, value: "1@localhost:9093" }
+            - { name: KAFKA_CONTROLLER_LISTENER_NAMES, value: "CONTROLLER" }
+            - { name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP, value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT" }
+            - { name: KAFKA_INTER_BROKER_LISTENER_NAME, value: "PLAINTEXT" }
+            # Semua faktor replikasi harus 1; default-nya 3 dan bikin broker tunggal macet.
+            - { name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR, value: "1" }
+            - { name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR, value: "1" }
+            - { name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR, value: "1" }
+            - { name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS, value: "0" }
+            - { name: KAFKA_AUTO_CREATE_TOPICS_ENABLE, value: "true" }
+            - { name: KAFKA_LOG_DIRS, value: "/tmp/kraft-combined-logs" }
+          ports:
+            - { containerPort: 9092, name: kafka }
+          readinessProbe:
+            tcpSocket: { port: 9092 }
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            failureThreshold: 20
+          resources:
+            requests: { cpu: 200m, memory: 512Mi }
+            limits:   { cpu: "1",  memory: 1536Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3nitor-test-kafka
+  labels:
+    app.kubernetes.io/part-of: s3nitor-test
+spec:
+  selector:
+    app.kubernetes.io/name: s3nitor-test-kafka
+  ports:
+    - { name: kafka, port: 9092, targetPort: 9092 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3nitor-test-redis
+  labels:
+    app.kubernetes.io/name: s3nitor-test-redis
+    app.kubernetes.io/part-of: s3nitor-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: s3nitor-test-redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: s3nitor-test-redis
+        app.kubernetes.io/part-of: s3nitor-test
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - { containerPort: 6379, name: redis }
+          readinessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3nitor-test-redis
+  labels:
+    app.kubernetes.io/part-of: s3nitor-test
+spec:
+  selector:
+    app.kubernetes.io/name: s3nitor-test-redis
+  ports:
+    - { name: redis, port: 6379, targetPort: 6379 }
