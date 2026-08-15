@@ -69,14 +69,8 @@ coverage.html
 downloads/
 s3-temp/
 
-# Build directory
-build/
-
-# Coverage files
 coverage.out
-coverage.html
 
-# Environment files
-.env
-.env.local
-.env.production
+# Agent / editor tooling
+.serena/
+.claude/
