@@ -29,6 +29,93 @@ A high-performance Go application designed for security professionals and DevOps
 - **Graceful Shutdown**: Proper cleanup and signal handling
 - **Modular Design**: Easy to extend with custom scanners and reporters
 
+## 🗄️ Storage Support
+
+Fetching works on any S3-compatible storage. What differs is **bucket notification**
+support, which determines whether event-driven mode is available.
+
+Only combinations marked **tested** have been verified end-to-end against real
+infrastructure by the scripts in `test/integration/`. Everything else is listed
+from vendor documentation and should be treated as unverified.
+
+| Storage | Fetch (S3 API) | Notification transport | Status |
+|---|---|---|---|
+| **MinIO** | ✅ | Redis (list, `format=access`) | **tested** — `test/integration/minio-redis.sh` |
+| **MinIO** | ✅ | Kafka | **tested** — `test/integration/minio-kafka.sh` |
+| **SeaweedFS** | ✅ (via `weed s3`) | Kafka (protobuf, filer layer) | **tested** — `test/integration/seaweedfs-kafka.sh` |
+| MinIO | ✅ | AMQP, NATS, MQTT, webhook | untested |
+| SeaweedFS | ✅ | SQS, PubSub, RabbitMQ | untested |
+| Ceph RGW | ✅ | Kafka, AMQP, HTTP | untested |
+| AWS S3 | ✅ | SQS / SNS / EventBridge (no direct Kafka) | untested |
+| Backblaze B2 | ✅ | webhook only | untested |
+| DigitalOcean Spaces | ✅ | none | fetch only |
+| Wasabi | ✅ | none | fetch only |
+
+Tested combinations were verified against real infrastructure: MinIO
+`RELEASE.2025-04-08T15-41-24Z`, SeaweedFS 3.80, Kafka 3.9 (KRaft), Redis 7.
+Each run uploads a small PDF under three key shapes — plain, containing a space,
+and nested under a prefix — then reads every object back and compares bytes.
+
+### Notes from testing MinIO
+
+Verified against MinIO `RELEASE.2025-04-08T15-41-24Z`; captured payload lives in
+`test/fixtures/event-minio-redis.json`.
+
+- **Object keys arrive percent-encoded.** Spaces become `+` and `/` becomes `%2F`
+  (`nested/deep/path.pdf` → `nested%2Fdeep%2Fpath.pdf`). Decode with Go's
+  `url.QueryUnescape` — `url.PathUnescape` leaves `+` untouched and silently
+  yields the wrong key.
+- **Streamed uploads report `s3:ObjectCreated:CompleteMultipartUpload`**, not
+  `:Put`. Subscribe to `s3:ObjectCreated:*` or such uploads are missed.
+- **The Redis target wraps events as `[{"Event":[…],"EventTime":…}]`**, not the
+  plain `{"Records":[…]}` shape used by webhook targets.
+- **ETag is not a content hash** for multipart uploads — it carries a `-N` suffix.
+  It is still a valid change-detection token.
+- **Redis lists provide no acknowledgement.** `LPOP`/`BRPOP` remove the event
+  immediately, so a consumer that dies mid-scan loses it permanently. Fine for
+  development; use Kafka where delivery must survive a crash.
+- **Configure notification targets with `MINIO_NOTIFY_*` environment variables.**
+  `mc admin config set` only stages values until a server restart, and
+  `mc admin service restart` requires a TTY so it fails silently under
+  `kubectl exec`. Note that env-configured targets appear in **uppercase** in the
+  ARN (`arn:minio:sqs::PRIMARY:redis`); read the ARN from `mc admin info --json`
+  rather than constructing it.
+
+### The envelope differs per transport, not just per vendor
+
+The same MinIO instance wraps the identical event differently depending on where
+it is delivered:
+
+| Transport | Envelope |
+|---|---|
+| Redis | `[{"Event":[…],"EventTime":…}]` |
+| Kafka | `{"EventName":…,"Key":…,"Records":[…]}` |
+
+The Kafka envelope also carries the key **twice, with different encodings**:
+top-level `"Key":"bucket/with space.pdf"` is raw and includes the bucket, while
+`Records[].s3.object.key` is `with+space.pdf`. Prefer the record field — the
+bucket is available separately as `Records[].s3.bucket.name`.
+
+Kafka consumer groups do provide acknowledgement: a consumer killed before
+committing receives the message again, which is exactly what Redis lists cannot
+offer.
+
+### Notes from testing SeaweedFS
+
+SeaweedFS emits notifications from its **filer** layer rather than its S3 layer,
+as **protobuf** (`filer_pb.EventNotification`) rather than JSON. Consequences:
+
+- **Paths, not bucket/key.** Events carry `/buckets/<bucket>/<prefix>` in the
+  `directory` field; bucket and key must be derived by stripping the prefix.
+- **Keys are not encoded** — spaces appear literally. The opposite of MinIO, so
+  unescaping must be per-decoder rather than applied uniformly.
+- **A content hash is available.** Chunks carry a base64 MD5 which was verified
+  to match the uploaded file exactly. There is still no S3-style ETag.
+- **Event amplification is roughly 5:1.** Three uploads produced fifteen filer
+  events, six of which pointed at `/buckets/<bucket>/.uploads/…` — unfinished
+  multipart fragments rather than real objects. A consumer that does not filter
+  `.uploads` will scan partial files and publish bogus results.
+
 ## 📋 Table of Contents
 
 - [Quick Start](#quick-start)
