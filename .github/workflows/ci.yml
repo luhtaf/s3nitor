@@ -1,0 +1,95 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      # CGO_ENABLED=1 everywhere: the sqlite3 driver needs it, and a build
+      # without cgo links a stub that only fails at runtime. See CLAUDE.md.
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+        run: go build ./...
+
+      - name: Vet
+        env:
+          CGO_ENABLED: "1"
+        run: go vet ./...
+
+      - name: Check go.mod is tidy
+        run: |
+          set -euo pipefail
+          cp go.mod go.mod.bak && cp go.sum go.sum.bak
+          go mod tidy
+          if ! diff -q go.mod go.mod.bak >/dev/null || ! diff -q go.sum go.sum.bak >/dev/null; then
+            echo "::error::go.mod/go.sum are not tidy — run 'go mod tidy' and commit the result"
+            diff -u go.mod.bak go.mod || true
+            exit 1
+          fi
+
+      - name: Test
+        env:
+          CGO_ENABLED: "1"
+        # No Go tests exist yet; this passes trivially and starts reporting the
+        # moment the first _test.go lands. The suites under test/integration/
+        # are shell and need a live cluster, so they stay out of CI.
+        run: go test ./...
+
+      - name: Smoke-test the binary against a real SQLite file
+        # The one failure mode `go build` cannot catch: a binary that compiles
+        # but cannot open its database. Point S3 at a dead port so the run fails
+        # immediately after the DB opens.
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          go build -o /tmp/s3scanner ./cmd/s3scanner
+          out=$(DB_DRIVER=sqlite3 DB_DSN=/tmp/ci-smoke.db \
+                S3_BUCKET=smoke S3_ENDPOINT="http://127.0.0.1:1" \
+                S3_ACCESS_KEY=x S3_SECRET_KEY=x \
+                AWS_EC2_METADATA_DISABLED=true AWS_REGION=us-east-1 \
+                /tmp/s3scanner 2>&1 || true)
+          echo "$out"
+          if grep -q "CGO_ENABLED=0" <<<"$out"; then
+            echo "::error::built without cgo — the sqlite3 driver is a stub"
+            exit 1
+          fi
+          if grep -q "failed init DB" <<<"$out"; then
+            echo "::error::binary cannot open its database"
+            exit 1
+          fi
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      # govulncheck rather than a generic image scanner: it does reachability
+      # analysis and only reports vulnerabilities in code that is actually
+      # called. Scanning go.mod alone reported 28 findings for this project, of
+      # which 20 were in golang.org/x/crypto SSH packages nothing here imports.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
