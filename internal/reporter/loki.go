@@ -28,10 +28,10 @@ func NewLokiReporter(cfg *config.Config) (*LokiReporter, error) {
 	}, nil
 }
 
-func (r *LokiReporter) Report(ctx context.Context, sc *scanner.ScanContext) error {
+func (r *LokiReporter) Report(ctx context.Context, fr *scanner.FileResult) error {
 	// Create enriched log message with metadata
 	logMessage := fmt.Sprintf("bucket=%s key=%s size=%d hashes=%v results=%v",
-		sc.Bucket, sc.Key, sc.Size, sc.Hashes, sc.Results)
+		fr.Bucket, fr.Key, fr.Size, fr.Hashes, fr.Results)
 
 	// Loki expects a specific format
 	lokiData := map[string]interface{}{

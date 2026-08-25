@@ -26,9 +26,12 @@ func NewPrometheusReporter(cfg *config.Config) (*PrometheusReporter, error) {
 	}, nil
 }
 
-func (r *PrometheusReporter) Report(ctx context.Context, sc *scanner.ScanContext) error {
-	// Convert scan results to Prometheus metrics
-	_ = r.convertToMetrics(sc)
+func (r *PrometheusReporter) Report(ctx context.Context, fr *scanner.FileResult) error {
+	// NOTE: this reporter does not work and is scheduled for replacement by a
+	// real pull-based exporter in internal/metrics. Prometheus scrapes; it does
+	// not accept pushes, so the text built below is discarded and an empty body
+	// is POSTed. Kept compiling only so this refactor carries no behavioural diff.
+	_ = r.convertToMetrics(fr)
 
 	// For simplicity, we'll use a basic HTTP endpoint
 	// In production, you might want to use a proper Prometheus client
@@ -51,7 +54,7 @@ func (r *PrometheusReporter) Report(ctx context.Context, sc *scanner.ScanContext
 	return nil
 }
 
-func (r *PrometheusReporter) convertToMetrics(sc *scanner.ScanContext) string {
+func (r *PrometheusReporter) convertToMetrics(fr *scanner.FileResult) string {
 	// Convert scan results to Prometheus format
 	// This is a simplified implementation
 	metrics := ""
@@ -65,19 +68,18 @@ func (r *PrometheusReporter) convertToMetrics(sc *scanner.ScanContext) string {
 	metrics += "# HELP s3_scanner_file_size_bytes File size in bytes\n"
 	metrics += "# TYPE s3_scanner_file_size_bytes gauge\n"
 	metrics += fmt.Sprintf("s3_scanner_file_size_bytes{bucket=\"%s\",key=\"%s\"} %d\n",
-		sc.Bucket, sc.Key, sc.Size)
+		fr.Bucket, fr.Key, fr.Size)
 
 	// Count malware detections from results
-	for scannerName, result := range sc.Results {
-		if resultMap, ok := result.(map[string]interface{}); ok {
-			if match, ok := resultMap["ioc_match"]; ok {
-				if detected, ok := match.(bool); ok && detected {
-					metrics += fmt.Sprintf("# HELP s3_scanner_%s_detected %s detection count\n", scannerName, scannerName)
-					metrics += fmt.Sprintf("# TYPE s3_scanner_%s_detected counter\n", scannerName)
-					metrics += fmt.Sprintf("s3_scanner_%s_detected 1\n", scannerName)
-				}
-			}
+	// Result is a typed struct now, so a match no longer has to be dug out of an
+	// untyped map under a scanner-specific key ("ioc_match", "yara_match", ...).
+	for scannerName, result := range fr.Results {
+		if !result.Match {
+			continue
 		}
+		metrics += fmt.Sprintf("# HELP s3_scanner_%s_detected %s detection count\n", scannerName, scannerName)
+		metrics += fmt.Sprintf("# TYPE s3_scanner_%s_detected counter\n", scannerName)
+		metrics += fmt.Sprintf("s3_scanner_%s_detected{severity=\"%s\"} 1\n", scannerName, result.Severity)
 	}
 
 	return metrics

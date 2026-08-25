@@ -3,8 +3,6 @@ package s3fetcher
 import (
 	"context"
 	"io"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/luhtaf/s3nitor/internal/config"
@@ -93,25 +91,20 @@ func (f *S3Fetcher) ListObjects(ctx context.Context) ([]S3Object, error) {
 	return objects, nil
 }
 
-func (f *S3Fetcher) Download(ctx context.Context, key string) (string, error) {
+// Open returns the object's body as a stream.
+//
+// Replaces the old Download, which wrote the object to a temp file and left the
+// caller to read it back to hash it. Handing back the stream lets the caller tee
+// it through a hasher while writing to disk, so the bytes are read once.
+//
+// The caller owns the returned ReadCloser and must close it.
+func (f *S3Fetcher) Open(ctx context.Context, key string) (io.ReadCloser, error) {
 	resp, err := f.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(f.bucket),
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	defer resp.Body.Close()
-
-	localPath := filepath.Join(os.TempDir(), filepath.Base(key))
-	outFile, err := os.Create(localPath)
-	if err != nil {
-		return "", err
-	}
-	defer outFile.Close()
-
-	if _, err := io.Copy(outFile, resp.Body); err != nil {
-		return "", err
-	}
-	return localPath, nil
+	return resp.Body, nil
 }

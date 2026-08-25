@@ -2,119 +2,144 @@ package scanner
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/luhtaf/s3nitor/internal/config"
 )
 
+// YARAScanner shells out to the yara binary once per rule file.
+//
+// It reads the downloaded object, so NeedsPayload is true and a spilled retry
+// has to fetch the bytes again.
 type YARAScanner struct {
 	enabled bool
 	path    string
 	yaraCmd string
+	version string
 }
 
+// NewYaraScanner self-disables when the binary is missing or the rules
+// directory holds no .yar files, so a misconfigured deployment degrades to
+// "this scanner is off" rather than failing every object.
 func NewYaraScanner(cfg *config.Config) *YARAScanner {
 	y := &YARAScanner{
 		enabled: cfg.EnableYara,
 		path:    "rules/yara/",
 		yaraCmd: cfg.YARACmd,
 	}
-
 	if cfg.YARAPath != "" {
 		y.path = cfg.YARAPath
 	}
-
 	if !y.enabled {
 		log.Println("YARAScanner: disabled via config")
 		return y
 	}
 
-	// Check if yara executable is available
 	if _, err := exec.LookPath(y.yaraCmd); err != nil {
 		log.Printf("YARAScanner: yara executable not found in PATH: %v", err)
 		y.enabled = false
 		return y
 	}
 
-	// Check if rules directory exists and has .yar files
-	files, err := filepath.Glob(filepath.Join(y.path, "*.yar"))
+	files, err := y.ruleFiles()
 	if err != nil {
 		log.Printf("YARAScanner: error listing yara files: %v", err)
 		y.enabled = false
 		return y
 	}
-
 	if len(files) == 0 {
 		log.Printf("YARAScanner: no .yar files found in %s", y.path)
 		y.enabled = false
 		return y
 	}
 
+	y.version = y.computeVersion(files)
 	log.Printf("YARAScanner: found %d yara files in %s", len(files), y.path)
 	return y
 }
 
-func (y *YARAScanner) Name() string  { return "yara_scanner" }
-func (y *YARAScanner) Enabled() bool { return y.enabled }
+func (y *YARAScanner) Name() string         { return "yara" }
+func (y *YARAScanner) Enabled() bool        { return y.enabled }
+func (y *YARAScanner) NeedsPayload() bool   { return true }
+func (y *YARAScanner) RulesVersion() string { return y.version }
 
-func (y *YARAScanner) Scan(ctx context.Context, sc *ScanContext) error {
-	if !y.enabled || sc.FilePath == "" {
-		return nil
+// Scan runs every rule file over the object and collects the rule names that fired.
+func (y *YARAScanner) Scan(ctx context.Context, in *ScanInput) (Result, error) {
+	if in.LocalPath == "" {
+		return Result{}, fmt.Errorf("yara: needs the payload but LocalPath is empty")
 	}
 
-	// Get all .yar files in the rules directory
-	ruleFiles, err := filepath.Glob(filepath.Join(y.path, "*.yar"))
+	ruleFiles, err := y.ruleFiles()
 	if err != nil {
-		return fmt.Errorf("error listing yara files: %v", err)
+		return Result{}, fmt.Errorf("yara: listing rules: %w", err)
 	}
-
 	if len(ruleFiles) == 0 {
-		return fmt.Errorf("no yara rule files found in %s", y.path)
+		return Result{}, fmt.Errorf("yara: no rule files in %s", y.path)
 	}
 
-	matches := []string{}
-
-	// Run yara command for each rule file
+	var matches []string
 	for _, ruleFile := range ruleFiles {
-		cmd := exec.CommandContext(ctx, y.yaraCmd, ruleFile, sc.FilePath)
-		output, err := cmd.Output()
-
+		out, err := exec.CommandContext(ctx, y.yaraCmd, ruleFile, in.LocalPath).Output()
 		if err != nil {
-			// If yara returns non-zero exit code, it might mean no matches found
-			// This is not necessarily an error
+			// yara exits 1 to mean "no rule matched", which is an ordinary
+			// result rather than a failure.
 			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-				// No matches found, this is normal
 				continue
 			}
 			log.Printf("YARAScanner: error running yara on %s: %v", ruleFile, err)
 			continue
 		}
-
-		// Parse output - yara outputs "rule_name file_path" for each match
-		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line != "" {
-				// Extract rule name (first part before space)
-				parts := strings.Fields(line)
-				if len(parts) > 0 {
-					ruleName := parts[0]
-					matches = append(matches, ruleName)
-				}
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			if fields := strings.Fields(strings.TrimSpace(line)); len(fields) > 0 {
+				matches = append(matches, fields[0])
 			}
 		}
 	}
+	sort.Strings(matches)
 
-	results := map[string]interface{}{
-		"yara_match": len(matches) > 0,
-		"yara_rules": matches,
-		"rule_files": len(ruleFiles),
+	res := Result{
+		Match:    len(matches) > 0,
+		Severity: SeverityInfo,
+		Detail: map[string]any{
+			"rules":      matches,
+			"rule_files": len(ruleFiles),
+		},
 	}
+	if res.Match {
+		// A pattern hit is weaker evidence than an exact hash hit: rules vary
+		// in precision and false positives are ordinary.
+		res.Severity = SeverityMedium
+	}
+	return res, nil
+}
 
-	sc.Results[y.Name()] = results
-	return nil
+// ruleFiles globs the rules directory. Only .yar is matched — .yara files are
+// not picked up.
+func (y *YARAScanner) ruleFiles() ([]string, error) {
+	return filepath.Glob(filepath.Join(y.path, "*.yar"))
+}
+
+// computeVersion fingerprints the rule files so editing a rule reschedules only
+// the yara tasks.
+func (y *YARAScanner) computeVersion(files []string) string {
+	sort.Strings(files)
+	h := sha256.New()
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			log.Printf("YARAScanner: cannot read %s for versioning: %v", f, err)
+			continue
+		}
+		h.Write([]byte(filepath.Base(f)))
+		h.Write(b)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:12]
 }

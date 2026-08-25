@@ -30,15 +30,15 @@ func NewElasticsearchReporter(cfg *config.Config) (*ElasticsearchReporter, error
 	}, nil
 }
 
-func (r *ElasticsearchReporter) Report(ctx context.Context, sc *scanner.ScanContext) error {
+func (r *ElasticsearchReporter) Report(ctx context.Context, fr *scanner.FileResult) error {
 	// Create enriched data with metadata
 	enrichedData := map[string]interface{}{
-		"bucket":    sc.Bucket,
-		"key":       sc.Key,
-		"size":      sc.Size,
-		"hashes":    sc.Hashes,
-		"scan_time": time.Now().Format(time.RFC3339),
-		"results":   sc.Results,
+		"bucket":    fr.Bucket,
+		"key":       fr.Key,
+		"size":      fr.Size,
+		"hashes":    fr.Hashes,
+		"scan_time": fr.ScanTime.Format(time.RFC3339),
+		"results":   fr.Results,
 	}
 
 	b, err := json.Marshal(enrichedData)

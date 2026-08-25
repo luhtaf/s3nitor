@@ -7,5 +7,5 @@ import (
 )
 
 type Reporter interface {
-	Report(ctx context.Context, sc *scanner.ScanContext) error
+	Report(ctx context.Context, fr *scanner.FileResult) error
 }
