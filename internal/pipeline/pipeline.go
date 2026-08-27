@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gorm.io/gorm"
@@ -49,6 +50,16 @@ type scanJob struct {
 	release func(Outcome)
 }
 
+// Summary is what one run did, logged at exit so a benchmark harness can read
+// it back without scraping a metrics endpoint that dies with the process.
+type Summary struct {
+	Listed   int
+	Scanned  int
+	Skipped  int
+	Failed   int
+	Duration time.Duration
+}
+
 // job carries an object from discovery to fetch.
 type job struct {
 	obj    s3fetcher.S3Object
@@ -83,6 +94,10 @@ type Pipeline struct {
 	// Releasing it when the transfer ended, as an earlier version did, meant
 	// fetch never backed off: it filled the channel and the disk while the
 	// accounting claimed the budget was free.
+	scanned atomic.Int64
+	skipped atomic.Int64
+	failed  atomic.Int64
+
 	byteLimiter *ByteLimiter
 	// connLimiter bounds concurrent transfers, a shorter span and a different
 	// resource.
@@ -128,7 +143,8 @@ func New(
 
 // Run pushes every object through the pipeline and returns once the last
 // document has been published.
-func (p *Pipeline) Run(ctx context.Context, objects []s3fetcher.S3Object) error {
+func (p *Pipeline) Run(ctx context.Context, objects []s3fetcher.S3Object) (Summary, error) {
+	started := time.Now()
 	jobs := make(chan job, p.cfg.StageQueueSize)
 	inputs := make(chan *scanJob, p.cfg.StageQueueSize)
 	results := make(chan *scanner.FileResult, p.cfg.StageQueueSize)
@@ -181,7 +197,13 @@ func (p *Pipeline) Run(ctx context.Context, objects []s3fetcher.S3Object) error 
 	close(results)
 	publishWG.Wait()
 
-	return err
+	return Summary{
+		Listed:   len(objects),
+		Scanned:  int(p.scanned.Load()),
+		Skipped:  int(p.skipped.Load()),
+		Failed:   int(p.failed.Load()),
+		Duration: time.Since(started),
+	}, err
 }
 
 // runDiscover filters objects and feeds the pipeline.
@@ -211,11 +233,13 @@ func (p *Pipeline) runDiscover(ctx context.Context, objects []s3fetcher.S3Object
 
 		if seen[ids[i]] {
 			p.m.ObjectsSkipped.WithLabelValues("already_scanned").Inc()
+			p.skipped.Add(1)
 			continue
 		}
 		if p.cfg.MaxObjectSize > 0 && obj.Size > p.cfg.MaxObjectSize {
 			log.Printf("discover: skipping %s, %d bytes exceeds MAX_OBJECT_SIZE", obj.Key, obj.Size)
 			p.m.ObjectsSkipped.WithLabelValues("too_large").Inc()
+			p.skipped.Add(1)
 
 			// Not scanning something is itself worth reporting. The largest
 			// objects in a bucket are exactly where something would be hidden,
@@ -292,6 +316,7 @@ func (p *Pipeline) runFetch(ctx context.Context, in <-chan job, out chan<- *scan
 		p.m.ObserveStage(stageFetch, started, err)
 		if err != nil {
 			log.Printf("fetch %s: %v", j.obj.Key, err)
+			p.failed.Add(1)
 			continue
 		}
 
@@ -416,6 +441,7 @@ func (p *Pipeline) runAnalyze(ctx context.Context, in <-chan *scanJob, out chan<
 		// and only now may the budget be returned.
 		done()
 		p.m.ObserveStage(stageAnalyze, started, nil)
+		p.scanned.Add(1)
 
 		for name, res := range result.Results {
 			p.m.Findings.WithLabelValues(name, string(res.Severity)).Inc()

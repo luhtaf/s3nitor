@@ -154,7 +154,7 @@ func TestByteBudgetBoundsBytesInFlight(t *testing.T) {
 	rep := &recordingReporter{}
 	p := New(cfg, opener, scanner.NewEngine(&config.Config{}), rep, testDB(t), metrics.New(), t.TempDir())
 
-	if err := p.Run(context.Background(), objs); err != nil {
+	if _, err := p.Run(context.Background(), objs); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -182,7 +182,7 @@ func TestObjectLargerThanBudgetStillCompletes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := p.Run(ctx, []s3fetcher.S3Object{
+	if _, err := p.Run(ctx, []s3fetcher.S3Object{
 		{Bucket: "b", Key: "huge", ETag: "e", Size: 8192},
 	}); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -201,7 +201,7 @@ func TestMaxObjectSizeSkipsBeforeFetching(t *testing.T) {
 	rep := &recordingReporter{}
 	p := New(cfg, opener, scanner.NewEngine(&config.Config{}), rep, testDB(t), metrics.New(), t.TempDir())
 
-	if err := p.Run(context.Background(), []s3fetcher.S3Object{
+	if _, err := p.Run(context.Background(), []s3fetcher.S3Object{
 		{Bucket: "b", Key: "small", ETag: "e1", Size: 100},
 		{Bucket: "b", Key: "big", ETag: "e2", Size: 5000},
 	}); err != nil {
@@ -252,7 +252,7 @@ func TestSecondRunSkipsAlreadyScannedObjects(t *testing.T) {
 
 	first := &recordingReporter{}
 	p1 := New(cfg, &fakeOpener{sizes: sizes}, scanner.NewEngine(&config.Config{}), first, gdb, metrics.New(), t.TempDir())
-	if err := p1.Run(context.Background(), objs); err != nil {
+	if _, err := p1.Run(context.Background(), objs); err != nil {
 		t.Fatalf("first run: %v", err)
 	}
 	if first.count() != 2 {
@@ -262,7 +262,7 @@ func TestSecondRunSkipsAlreadyScannedObjects(t *testing.T) {
 	second := &recordingReporter{}
 	opener2 := &fakeOpener{sizes: sizes}
 	p2 := New(cfg, opener2, scanner.NewEngine(&config.Config{}), second, gdb, metrics.New(), t.TempDir())
-	if err := p2.Run(context.Background(), objs); err != nil {
+	if _, err := p2.Run(context.Background(), objs); err != nil {
 		t.Fatalf("second run: %v", err)
 	}
 	if second.count() != 0 {
@@ -275,7 +275,7 @@ func TestSecondRunSkipsAlreadyScannedObjects(t *testing.T) {
 	// A changed ETag is a different version, so it must be scanned again.
 	third := &recordingReporter{}
 	p3 := New(cfg, &fakeOpener{sizes: sizes}, scanner.NewEngine(&config.Config{}), third, gdb, metrics.New(), t.TempDir())
-	if err := p3.Run(context.Background(), []s3fetcher.S3Object{
+	if _, err := p3.Run(context.Background(), []s3fetcher.S3Object{
 		{Bucket: "b", Key: "a", ETag: "CHANGED", Size: 64},
 	}); err != nil {
 		t.Fatalf("third run: %v", err)
@@ -303,7 +303,7 @@ func TestPartialBatchIsFlushedOnShutdown(t *testing.T) {
 	rep := &recordingReporter{}
 	p := New(cfg, &fakeOpener{sizes: sizes}, scanner.NewEngine(&config.Config{}), rep, testDB(t), metrics.New(), t.TempDir())
 
-	if err := p.Run(context.Background(), objs); err != nil {
+	if _, err := p.Run(context.Background(), objs); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if rep.count() != 3 {
@@ -368,7 +368,7 @@ func TestBudgetCoversDiskResidencyNotJustTransfer(t *testing.T) {
 		}
 	}()
 
-	if err := p.Run(context.Background(), objs); err != nil {
+	if _, err := p.Run(context.Background(), objs); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	close(stop)

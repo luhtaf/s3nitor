@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 func TestParseBytes(t *testing.T) {
 	ok := []struct {
@@ -34,5 +37,18 @@ func TestParseBytes(t *testing.T) {
 		if got, err := ParseBytes(in); err == nil {
 			t.Errorf("ParseBytes(%q) = %d, want an error", in, got)
 		}
+	}
+}
+
+// An empty setting is not always the same as an absent one.
+func TestEmptyMetricsAddrDisablesTheServer(t *testing.T) {
+	t.Setenv("METRICS_ADDR", "")
+	if got := getUnlessSet("METRICS_ADDR", ":8080"); got != "" {
+		t.Errorf("METRICS_ADDR=\"\" gave %q, want \"\" so the server stays off", got)
+	}
+
+	os.Unsetenv("METRICS_ADDR")
+	if got := getUnlessSet("METRICS_ADDR", ":8080"); got != ":8080" {
+		t.Errorf("unset METRICS_ADDR gave %q, want the default", got)
 	}
 }

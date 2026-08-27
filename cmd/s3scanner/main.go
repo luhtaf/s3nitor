@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/luhtaf/s3nitor/internal/config"
 	"github.com/luhtaf/s3nitor/internal/db"
@@ -14,6 +16,7 @@ import (
 	"github.com/luhtaf/s3nitor/internal/reporter"
 	"github.com/luhtaf/s3nitor/internal/s3fetcher"
 	"github.com/luhtaf/s3nitor/internal/scanner"
+	"github.com/luhtaf/s3nitor/internal/sysinfo"
 )
 
 // Version is set at build time via -ldflags "-X main.Version=..."
@@ -81,10 +84,56 @@ func run() error {
 	log.Printf("listed %d objects", len(objects))
 
 	p := pipeline.New(cfg, fetcher, scanner.NewEngine(cfg), rep, gdb, m, workDir)
-	if err := p.Run(ctx, objects); err != nil {
+	summary, err := p.Run(ctx, objects)
+	if err != nil {
 		return err
 	}
 
-	log.Println("done scanning S3 bucket")
+	logSummary(summary)
 	return nil
+}
+
+// logSummary prints one machine-readable line describing the run.
+//
+// Emitted to the log rather than left to the metrics endpoint because a
+// single-shot job's endpoint dies with the process: by the time anything
+// scrapes it, the run is over. A benchmark harness reads this line instead.
+//
+// Peak memory comes from the cgroup or VmHWM, not runtime.MemStats. MemStats
+// covers the Go heap, while the SQLite driver is cgo and allocates outside it —
+// so a run can look comfortable there and still be OOM-killed. The source is
+// printed alongside the figure, since a cgroup reading and a getrusage one are
+// not comparable.
+func logSummary(s pipeline.Summary) {
+	rate := 0.0
+	if secs := s.Duration.Seconds(); secs > 0 {
+		rate = float64(s.Scanned) / secs
+	}
+
+	peak, source, err := sysinfo.PeakRSS()
+	if err != nil {
+		log.Printf("run summary: listed=%d scanned=%d skipped=%d failed=%d duration=%s rate=%.1f/s peak_rss=unavailable (%v)",
+			s.Listed, s.Scanned, s.Skipped, s.Failed, s.Duration.Round(time.Millisecond), rate, err)
+		return
+	}
+
+	log.Printf("run summary: listed=%d scanned=%d skipped=%d failed=%d duration=%s rate=%.1f/s peak_rss=%d peak_rss_human=%s peak_rss_source=%s",
+		s.Listed, s.Scanned, s.Skipped, s.Failed,
+		s.Duration.Round(time.Millisecond), rate,
+		peak, humanBytes(peak), source)
+}
+
+// humanBytes renders a byte count for the log line; the raw figure is printed
+// beside it so a harness never has to parse this.
+func humanBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%dB", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }

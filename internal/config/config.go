@@ -117,7 +117,7 @@ func Load() *Config {
 		PublishMaxBytes:      getBytes("PUBLISH_MAX_BYTES", 5*MB),
 
 		StageQueueSize: getInt("STAGE_QUEUE_SIZE", 1000),
-		MetricsAddr:    getOrDefault("METRICS_ADDR", ":8080"),
+		MetricsAddr:    getUnlessSet("METRICS_ADDR", ":8080"),
 	}
 }
 
@@ -127,6 +127,19 @@ func getOrDefault(key, def string) string {
 		return def
 	}
 	return val
+}
+
+// getUnlessSet distinguishes an unset variable from one set to the empty string.
+//
+// getOrDefault treats both as "use the default", which is right for a path but
+// wrong wherever empty is itself a choice: METRICS_ADDR="" means do not listen,
+// and falling back to the default would bind a port the operator asked not to
+// have.
+func getUnlessSet(key, def string) string {
+	if val, ok := os.LookupEnv(key); ok {
+		return val
+	}
+	return def
 }
 
 // getInt reads an integer setting, falling back to def when unset or unparseable.
