@@ -149,7 +149,7 @@ func (p *Pipeline) Run(ctx context.Context, objects []s3fetcher.S3Object) error 
 		p.runPublish(ctx, results)
 	}()
 
-	err := p.runDiscover(ctx, objects, jobs)
+	err := p.runDiscover(ctx, objects, jobs, results)
 
 	// Close in order, waiting each time: a stage may only stop once nothing can
 	// still arrive for it.
@@ -167,7 +167,7 @@ func (p *Pipeline) Run(ctx context.Context, objects []s3fetcher.S3Object) error 
 //
 // Dedup is one batched query rather than one per object: discovery holds whole
 // pages, so a thousand objects cost one round trip instead of a thousand.
-func (p *Pipeline) runDiscover(ctx context.Context, objects []s3fetcher.S3Object, out chan<- job) error {
+func (p *Pipeline) runDiscover(ctx context.Context, objects []s3fetcher.S3Object, out chan<- job, notices chan<- *scanner.FileResult) error {
 	started := time.Now()
 
 	ids := make([]string, len(objects))
@@ -195,6 +195,17 @@ func (p *Pipeline) runDiscover(ctx context.Context, objects []s3fetcher.S3Object
 		if p.cfg.MaxObjectSize > 0 && obj.Size > p.cfg.MaxObjectSize {
 			log.Printf("discover: skipping %s, %d bytes exceeds MAX_OBJECT_SIZE", obj.Key, obj.Size)
 			p.m.ObjectsSkipped.WithLabelValues("too_large").Inc()
+
+			// Not scanning something is itself worth reporting. The largest
+			// objects in a bucket are exactly where something would be hidden,
+			// and a log line plus a counter disappears the moment the pod does.
+			// Publishing the gap puts it in the same index as real findings, so
+			// the alerting that already watches that index catches it too.
+			select {
+			case notices <- coverageGap(obj, ids[i], "exceeds_max_object_size", p.cfg.MaxObjectSize):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 			continue
 		}
 
@@ -209,6 +220,41 @@ func (p *Pipeline) runDiscover(ctx context.Context, objects []s3fetcher.S3Object
 	p.m.ObserveStage(stageDiscover, started, nil)
 	log.Printf("discover: %d queued, %d skipped", queued, len(objects)-queued)
 	return nil
+}
+
+// coverageGap builds a document recording that an object was deliberately not
+// scanned.
+//
+// Match is false because nothing was detected — nothing was looked at. The gap
+// is carried by scanned:false in the detail instead, so a dashboard can ask for
+// coverage holes separately from detections.
+//
+// Deliberately no FileRecord is written for these. Leaving the object unrecorded
+// means raising MAX_OBJECT_SIZE later picks it up on the next run rather than
+// skipping it forever as "already handled". Republishing the same notice each
+// run is harmless where the sink keys on a deterministic document id.
+func coverageGap(obj s3fetcher.S3Object, fileID, reason string, limit int64) *scanner.FileResult {
+	return &scanner.FileResult{
+		FileID:  fileID,
+		Bucket:  obj.Bucket,
+		Key:     obj.Key,
+		Version: obj.ETag,
+		Size:    obj.Size,
+		Hashes:  map[string]string{}, // never fetched, so nothing was hashed
+		Results: map[string]scanner.Result{
+			"size_gate": {
+				Match:    false,
+				Severity: scanner.SeverityLow,
+				Detail: map[string]any{
+					"scanned":     false,
+					"reason":      reason,
+					"object_size": obj.Size,
+					"limit":       limit,
+				},
+			},
+		},
+		ScanTime: time.Now().UTC(),
+	}
 }
 
 // runFetch downloads objects, hashing them on the way through.
@@ -375,8 +421,26 @@ func (p *Pipeline) runPublish(ctx context.Context, in <-chan *scanner.FileResult
 				return
 			}
 
+			size := estimateSize(result)
+
+			// A document that exceeds the ceiling on its own goes alone.
+			//
+			// Appending it first would drag whatever had already accumulated
+			// into the same request, pushing it further past the limit rather
+			// than closer to it — and Elasticsearch rejects a _bulk body over
+			// http.max_content_length outright rather than splitting it.
+			if size >= p.cfg.PublishMaxBytes {
+				stopTimer()
+				if len(batch) > 0 {
+					p.flush(ctx, batch, "bytes")
+					batch, batchBytes = nil, 0
+				}
+				p.flush(ctx, []*scanner.FileResult{result}, "oversize")
+				continue
+			}
+
 			batch = append(batch, result)
-			batchBytes += estimateSize(result)
+			batchBytes += size
 
 			if len(batch) == 1 {
 				timer = time.NewTimer(p.cfg.PublishFlushInterval)

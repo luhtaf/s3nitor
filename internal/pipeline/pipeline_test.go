@@ -206,11 +206,34 @@ func TestMaxObjectSizeSkipsBeforeFetching(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if rep.count() != 1 {
-		t.Errorf("published %d documents, want 1 (the oversized object should be skipped)", rep.count())
+	// Two documents: the scan of the small object, and a coverage notice saying
+	// the large one was never looked at. Skipping silently would hide the gap.
+	if rep.count() != 2 {
+		t.Fatalf("published %d documents, want 2 (one scan, one coverage gap)", rep.count())
 	}
 	if opener.peakBytes() > 100 {
 		t.Error("the oversized object was transferred despite being over the limit")
+	}
+
+	var gaps int
+	for _, doc := range rep.docs {
+		res, ok := doc.Results["size_gate"]
+		if !ok {
+			continue
+		}
+		gaps++
+		if doc.Key != "big" {
+			t.Errorf("coverage gap reported for %q, want \"big\"", doc.Key)
+		}
+		if scanned, _ := res.Detail["scanned"].(bool); scanned {
+			t.Error("coverage gap claims the object was scanned")
+		}
+		if got, _ := res.Detail["object_size"].(int64); got != 5000 {
+			t.Errorf("coverage gap object_size = %v, want 5000", res.Detail["object_size"])
+		}
+	}
+	if gaps != 1 {
+		t.Errorf("got %d coverage gaps, want 1", gaps)
 	}
 }
 
