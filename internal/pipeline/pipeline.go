@@ -39,6 +39,16 @@ type ObjectOpener interface {
 	Open(ctx context.Context, key string) (io.ReadCloser, error)
 }
 
+// scanJob carries an input together with the byte budget it still holds.
+//
+// The release travels with the payload because whoever deletes the temp file is
+// the only one who can honestly say the bytes are gone — and that is the analyze
+// stage, not fetch.
+type scanJob struct {
+	in      *scanner.ScanInput
+	release func(Outcome)
+}
+
 // job carries an object from discovery to fetch.
 type job struct {
 	obj    s3fetcher.S3Object
@@ -67,7 +77,16 @@ type Pipeline struct {
 	gdb     *gorm.DB
 	m       *metrics.Metrics
 
-	fetchLimiter   *ByteLimiter
+	// byteLimiter is the global brake. It is held from the moment a transfer
+	// starts until the payload is deleted after scanning, because the bytes are
+	// resident for that whole span — first in network buffers, then on disk.
+	// Releasing it when the transfer ended, as an earlier version did, meant
+	// fetch never backed off: it filled the channel and the disk while the
+	// accounting claimed the budget was free.
+	byteLimiter *ByteLimiter
+	// connLimiter bounds concurrent transfers, a shorter span and a different
+	// resource.
+	connLimiter    *FixedLimiter
 	analyzeLimiter *FixedLimiter
 	workDir        string
 }
@@ -93,11 +112,13 @@ func New(
 	p := &Pipeline{
 		cfg: cfg, fetcher: fetcher, engine: engine, rep: rep, gdb: gdb, m: m,
 		workDir:        workDir,
-		fetchLimiter:   NewByteLimiter(stageFetch, cfg.FetchByteBudget, cfg.FetchMaxConns),
+		byteLimiter:    NewByteLimiter("bytes", cfg.FetchByteBudget),
+		connLimiter:    NewFixedLimiter("conns", cfg.FetchMaxConns),
 		analyzeLimiter: NewFixedLimiter(stageAnalyze, cpu),
 	}
 
-	m.WatchLimiter(p.fetchLimiter)
+	m.WatchLimiter(p.byteLimiter)
+	m.WatchLimiter(p.connLimiter)
 	m.WatchLimiter(p.analyzeLimiter)
 
 	log.Printf("pipeline: fetch budget %d bytes over %d conns, analyze %d workers, publish batch %d / %s",
@@ -109,7 +130,7 @@ func New(
 // document has been published.
 func (p *Pipeline) Run(ctx context.Context, objects []s3fetcher.S3Object) error {
 	jobs := make(chan job, p.cfg.StageQueueSize)
-	inputs := make(chan *scanner.ScanInput, p.cfg.StageQueueSize)
+	inputs := make(chan *scanJob, p.cfg.StageQueueSize)
 	results := make(chan *scanner.FileResult, p.cfg.StageQueueSize)
 
 	stopSampling := p.sampleQueueDepth(map[string]func() int{
@@ -258,7 +279,7 @@ func coverageGap(obj s3fetcher.S3Object, fileID, reason string, limit int64) *sc
 }
 
 // runFetch downloads objects, hashing them on the way through.
-func (p *Pipeline) runFetch(ctx context.Context, in <-chan job, out chan<- *scanner.ScanInput) {
+func (p *Pipeline) runFetch(ctx context.Context, in <-chan job, out chan<- *scanJob) {
 	for j := range in {
 		select {
 		case <-ctx.Done():
@@ -267,7 +288,7 @@ func (p *Pipeline) runFetch(ctx context.Context, in <-chan job, out chan<- *scan
 		}
 
 		started := time.Now()
-		input, err := p.fetchOne(ctx, j)
+		sj, err := p.fetchOne(ctx, j)
 		p.m.ObserveStage(stageFetch, started, err)
 		if err != nil {
 			log.Printf("fetch %s: %v", j.obj.Key, err)
@@ -275,9 +296,12 @@ func (p *Pipeline) runFetch(ctx context.Context, in <-chan job, out chan<- *scan
 		}
 
 		select {
-		case out <- input:
+		case out <- sj:
 		case <-ctx.Done():
-			os.Remove(input.LocalPath)
+			// Blocking here while holding the budget is the backpressure
+			// working. On the way out it still has to be handed back.
+			os.Remove(sj.in.LocalPath)
+			sj.release(Outcome{Err: ctx.Err()})
 			return
 		}
 	}
@@ -285,33 +309,44 @@ func (p *Pipeline) runFetch(ctx context.Context, in <-chan job, out chan<- *scan
 
 // fetchOne reserves budget for the object, streams it to disk and hashes it in
 // the same pass.
-func (p *Pipeline) fetchOne(ctx context.Context, j job) (*scanner.ScanInput, error) {
-	// The object's size is the weight: this is the point at which memory is
-	// actually bounded.
-	release, err := p.fetchLimiter.Acquire(ctx, j.obj.Size)
+func (p *Pipeline) fetchOne(ctx context.Context, j job) (*scanJob, error) {
+	// The object's size is the weight. This reservation outlives the function:
+	// it travels to the analyze stage and is released once the payload is gone.
+	releaseBytes, err := p.byteLimiter.Acquire(ctx, j.obj.Size)
 	if err != nil {
+		return nil, err
+	}
+
+	// A connection slot, by contrast, is only needed while bytes are moving.
+	releaseConn, err := p.connLimiter.Acquire(ctx, 1)
+	if err != nil {
+		releaseBytes(Outcome{Err: err})
 		return nil, err
 	}
 
 	start := time.Now()
 	var body io.ReadCloser
 
-	// Everything the budget is meant to cover has to be finished before it is
-	// handed back. Releasing while the response body is still open would leave
-	// its network buffers outside the accounting, so the real peak could exceed
-	// the budget even though the limiter was obeyed — which is precisely what
-	// TestByteBudgetBoundsBytesInFlight caught.
-	done := func(err error) {
+	// Anything the transfer holds must be finished before the connection slot
+	// goes back. Releasing while the response body is still open would leave its
+	// network buffers outside the accounting, so the real peak could exceed the
+	// budget even though the limiter was obeyed.
+	endTransfer := func(err error) {
 		if body != nil {
 			body.Close()
 		}
-		release(Outcome{Err: err, Latency: time.Since(start)})
+		releaseConn(Outcome{Err: err, Latency: time.Since(start)})
+	}
+	// fail hands everything back, for the paths that produce no payload.
+	fail := func(err error) (*scanJob, error) {
+		endTransfer(err)
+		releaseBytes(Outcome{Err: err})
+		return nil, err
 	}
 
 	body, err = p.fetcher.Open(ctx, j.obj.Key)
 	if err != nil {
-		done(err)
-		return nil, err
+		return fail(err)
 	}
 
 	// The temp file is named by FileID, so two objects sharing a basename can no
@@ -319,8 +354,7 @@ func (p *Pipeline) fetchOne(ctx context.Context, j job) (*scanner.ScanInput, err
 	localPath := filepath.Join(p.workDir, j.fileID)
 	f, err := os.Create(localPath)
 	if err != nil {
-		done(err)
-		return nil, err
+		return fail(err)
 	}
 
 	h := hashing.New()
@@ -330,48 +364,58 @@ func (p *Pipeline) fetchOne(ctx context.Context, j job) (*scanner.ScanInput, err
 	}
 	if copyErr != nil {
 		os.Remove(localPath)
-		done(copyErr)
-		return nil, copyErr
+		return fail(copyErr)
 	}
 
-	// Released here rather than after analysis: the budget bounds bytes in
-	// flight through the transfer. Holding it across scanning would tie two
-	// unrelated resources together and starve fetch behind CPU work.
-	done(nil)
+	endTransfer(nil)
 
-	return &scanner.ScanInput{
-		FileID:    j.fileID,
-		Bucket:    j.obj.Bucket,
-		Key:       j.obj.Key,
-		Version:   j.obj.ETag,
-		Size:      h.Size(),
-		Hashes:    h.Sum(),
-		LocalPath: localPath,
+	return &scanJob{
+		in: &scanner.ScanInput{
+			FileID:    j.fileID,
+			Bucket:    j.obj.Bucket,
+			Key:       j.obj.Key,
+			Version:   j.obj.ETag,
+			Size:      h.Size(),
+			Hashes:    h.Sum(),
+			LocalPath: localPath,
+		},
+		release: releaseBytes,
 	}, nil
 }
 
-// runAnalyze runs the scanners and deletes the payload once they are done.
-func (p *Pipeline) runAnalyze(ctx context.Context, in <-chan *scanner.ScanInput, out chan<- *scanner.FileResult) {
-	for input := range in {
+// runAnalyze runs the scanners, deletes the payload, and only then returns the
+// byte budget the fetch stage reserved for it.
+func (p *Pipeline) runAnalyze(ctx context.Context, in <-chan *scanJob, out chan<- *scanner.FileResult) {
+	for sj := range in {
+		// Whatever happens, the payload is deleted and the budget handed back.
+		// Missing either on any path leaks disk or wedges the pipeline: once the
+		// budget is held by reservations nobody returns, fetch never gets
+		// another token.
+		done := func() {
+			os.Remove(sj.in.LocalPath)
+			sj.release(Outcome{})
+		}
+
 		select {
 		case <-ctx.Done():
-			os.Remove(input.LocalPath)
+			done()
 			return
 		default:
 		}
 
 		started := time.Now()
-		release, err := p.analyzeLimiter.Acquire(ctx, 1)
+		releaseCPU, err := p.analyzeLimiter.Acquire(ctx, 1)
 		if err != nil {
-			os.Remove(input.LocalPath)
+			done()
 			return
 		}
-		result := p.engine.ProcessFile(ctx, input)
-		release(Outcome{Latency: time.Since(started)})
+		result := p.engine.ProcessFile(ctx, sj.in)
+		releaseCPU(Outcome{Latency: time.Since(started)})
 
-		// The payload has no reader left: every scanner needing it has run.
-		os.Remove(input.LocalPath)
-		p.m.ObserveStage(stageAnalyze, started, err)
+		// Every scanner that needed the bytes has run, so the payload can go —
+		// and only now may the budget be returned.
+		done()
+		p.m.ObserveStage(stageAnalyze, started, nil)
 
 		for name, res := range result.Results {
 			p.m.Findings.WithLabelValues(name, string(res.Severity)).Inc()

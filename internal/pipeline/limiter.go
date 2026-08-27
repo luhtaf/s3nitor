@@ -83,34 +83,33 @@ func (l *FixedLimiter) Acquire(ctx context.Context, _ int64) (func(Outcome), err
 	}
 }
 
-// ByteLimiter admits work against a budget measured in bytes, with a separate
-// ceiling on how many items may be in flight at once.
+// ByteLimiter admits work against a budget measured in bytes.
 //
-// This is the whole point of the refactor. Bounding the fetch stage by file
-// count means picking a number that is safe for the largest object you might
-// ever meet, which makes it far too small for the ordinary case. Bounding by
-// bytes admits fifty thousand 10 KB objects or one 512 MB object against the
-// same budget, and both are correct.
+// This is the whole point of the refactor. Bounding a stage by item count means
+// picking a number safe for the largest object you might ever meet, which makes
+// it far too small for the ordinary case. Bounding by bytes admits fifty
+// thousand 10 KB objects or one 512 MB object against the same budget, and both
+// are correct.
+//
+// It counts bytes only. Concurrency is a separate concern with a separate
+// limiter, because the two are held for different spans: a connection is done
+// once the transfer is, while the bytes stay resident on disk until the scanners
+// have finished with them.
 type ByteLimiter struct {
 	name     string
 	bytes    *semaphore.Weighted
-	conns    chan struct{}
 	budget   int64
 	inFlight atomic.Int64
 }
 
-// NewByteLimiter returns a limiter over budget bytes and maxConns transfers.
-func NewByteLimiter(name string, budget int64, maxConns int) *ByteLimiter {
+// NewByteLimiter returns a limiter over budget bytes.
+func NewByteLimiter(name string, budget int64) *ByteLimiter {
 	if budget < 1 {
 		budget = 1
-	}
-	if maxConns < 1 {
-		maxConns = 1
 	}
 	return &ByteLimiter{
 		name:   name,
 		bytes:  semaphore.NewWeighted(budget),
-		conns:  make(chan struct{}, maxConns),
 		budget: budget,
 	}
 }
@@ -119,7 +118,7 @@ func (l *ByteLimiter) Name() string    { return l.name }
 func (l *ByteLimiter) Limit() int64    { return l.budget }
 func (l *ByteLimiter) InFlight() int64 { return l.inFlight.Load() }
 
-// Acquire reserves weight bytes and one transfer slot.
+// Acquire reserves weight bytes.
 //
 // A weight larger than the entire budget is clamped rather than rejected.
 // semaphore.Weighted blocks forever on an unsatisfiable request, so an object
@@ -133,20 +132,13 @@ func (l *ByteLimiter) Acquire(ctx context.Context, weight int64) (func(Outcome),
 		return nil, fmt.Errorf("%s: negative weight %d", l.name, weight)
 	}
 	if weight < 1 {
-		weight = 1 // an empty object still occupies a transfer slot
+		weight = 1 // an empty object still occupies the pipeline
 	}
 	if weight > l.budget {
 		weight = l.budget
 	}
 
-	select {
-	case l.conns <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-
 	if err := l.bytes.Acquire(ctx, weight); err != nil {
-		<-l.conns
 		return nil, err
 	}
 
@@ -156,7 +148,6 @@ func (l *ByteLimiter) Acquire(ctx context.Context, weight int64) (func(Outcome),
 		if once.CompareAndSwap(false, true) {
 			l.inFlight.Add(-weight)
 			l.bytes.Release(weight)
-			<-l.conns
 		}
 	}, nil
 }

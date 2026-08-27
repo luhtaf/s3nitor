@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -163,8 +164,8 @@ func TestByteBudgetBoundsBytesInFlight(t *testing.T) {
 	if got := rep.count(); got != objects {
 		t.Errorf("published %d documents, want %d", got, objects)
 	}
-	if p.fetchLimiter.InFlight() != 0 {
-		t.Errorf("fetch limiter leaked %d bytes", p.fetchLimiter.InFlight())
+	if p.byteLimiter.InFlight() != 0 {
+		t.Errorf("byte budget leaked %d bytes", p.byteLimiter.InFlight())
 	}
 }
 
@@ -307,5 +308,82 @@ func TestPartialBatchIsFlushedOnShutdown(t *testing.T) {
 	}
 	if rep.count() != 3 {
 		t.Errorf("published %d documents, want 3 — the partial batch was dropped", rep.count())
+	}
+}
+
+// The budget has to cover disk residency, not just the transfer.
+//
+// An earlier version released it the moment the transfer finished, so a slow
+// analyze stage let fetched files pile up on disk while the accounting said the
+// budget was free — bounded only by the channel buffer, which is a count and not
+// a size. With a slow scanner and a budget of two objects, no more than two
+// payloads may exist at once.
+func TestBudgetCoversDiskResidencyNotJustTransfer(t *testing.T) {
+	const (
+		objects    = 12
+		objectSize = 512
+		budget     = objectSize * 2
+	)
+
+	cfg := testConfig()
+	cfg.FetchByteBudget = budget
+	cfg.FetchMaxConns = 8    // deliberately more slots than the budget allows
+	cfg.AnalyzeCPULimit = 1  // one slow scanner, so payloads would queue up
+	cfg.StageQueueSize = 100 // a count-based bound would permit 100 files here
+
+	sizes := make(map[string]int64, objects)
+	objs := make([]s3fetcher.S3Object, 0, objects)
+	for i := 0; i < objects; i++ {
+		key := fmt.Sprintf("obj-%02d", i)
+		sizes[key] = objectSize
+		objs = append(objs, s3fetcher.S3Object{
+			Bucket: "b", Key: key, ETag: key, Size: objectSize,
+		})
+	}
+
+	workDir := t.TempDir()
+	rep := &recordingReporter{}
+	p := New(cfg, &fakeOpener{sizes: sizes, delay: time.Millisecond},
+		scanner.NewEngine(&config.Config{}), rep, testDB(t), metrics.New(), workDir)
+
+	// Watch the work directory while the run proceeds.
+	var peakFiles int64
+	stop := make(chan struct{})
+	var watcher sync.WaitGroup
+	watcher.Add(1)
+	go func() {
+		defer watcher.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if entries, err := os.ReadDir(workDir); err == nil {
+				if n := int64(len(entries)); n > atomic.LoadInt64(&peakFiles) {
+					atomic.StoreInt64(&peakFiles, n)
+				}
+			}
+			time.Sleep(200 * time.Microsecond)
+		}
+	}()
+
+	if err := p.Run(context.Background(), objs); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	close(stop)
+	watcher.Wait()
+
+	if peak := atomic.LoadInt64(&peakFiles); peak > budget/objectSize {
+		t.Errorf("peak payloads on disk = %d, budget allows %d", peak, budget/objectSize)
+	}
+	if rep.count() != objects {
+		t.Errorf("published %d documents, want %d", rep.count(), objects)
+	}
+	if p.byteLimiter.InFlight() != 0 {
+		t.Errorf("byte budget leaked %d bytes", p.byteLimiter.InFlight())
+	}
+	if left, _ := os.ReadDir(workDir); len(left) != 0 {
+		t.Errorf("%d payloads left behind", len(left))
 	}
 }

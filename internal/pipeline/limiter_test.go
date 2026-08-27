@@ -54,7 +54,7 @@ func TestFixedLimiterBoundsConcurrency(t *testing.T) {
 // item count, so the number of items admitted depends on how large they are.
 func TestByteLimiterBoundsBytesNotCount(t *testing.T) {
 	const budget = 1000
-	l := NewByteLimiter("fetch", budget, 100)
+	l := NewByteLimiter("fetch", budget)
 	ctx := context.Background()
 
 	// Ten small items fit inside the same budget as one large item.
@@ -88,7 +88,7 @@ func TestByteLimiterBoundsBytesNotCount(t *testing.T) {
 // An object larger than the whole budget must still make progress. Passing it
 // straight to semaphore.Weighted would block until the context died.
 func TestByteLimiterClampsOversizedItems(t *testing.T) {
-	l := NewByteLimiter("fetch", 1000, 10)
+	l := NewByteLimiter("fetch", 1000)
 
 	done := make(chan struct{})
 	go func() {
@@ -113,7 +113,7 @@ func TestByteLimiterClampsOversizedItems(t *testing.T) {
 func TestLimitersRespectContextCancellation(t *testing.T) {
 	for _, l := range []Limiter{
 		NewFixedLimiter("cpu", 1),
-		NewByteLimiter("fetch", 10, 1),
+		NewByteLimiter("fetch", 10),
 	} {
 		t.Run(l.Name(), func(t *testing.T) {
 			hold, err := l.Acquire(context.Background(), 10)
@@ -134,7 +134,7 @@ func TestLimitersRespectContextCancellation(t *testing.T) {
 // Release is called from deferred paths that can run more than once during
 // shutdown; double-releasing must not corrupt the accounting.
 func TestReleaseIsIdempotent(t *testing.T) {
-	l := NewByteLimiter("fetch", 100, 5)
+	l := NewByteLimiter("fetch", 100)
 	release, err := l.Acquire(context.Background(), 50)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
