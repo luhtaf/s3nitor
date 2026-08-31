@@ -36,7 +36,7 @@ type FileRecord struct {
 
 // Migrate creates or updates the tables.
 func Migrate(db *gorm.DB) error {
-	return db.AutoMigrate(&FileRecord{}, &ScanTask{})
+	return db.AutoMigrate(&FileRecord{}, &ScanTask{}, &IntelCache{})
 }
 
 // UpsertFileRecord writes the record, overwriting an existing row for the same

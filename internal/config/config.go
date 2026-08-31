@@ -74,6 +74,45 @@ type Config struct {
 	// queue is what makes a slow stage push back on a fast one.
 	StageQueueSize int
 
+	// SpillScanners names the scanners whose full queue spills to the pending
+	// store instead of blocking upstream.
+	//
+	// The distinction is how long the wait is, not how slow the scanner is. CPU
+	// saturation clears in seconds, so blocking is honest backpressure. An API
+	// quota clears in hours, so blocking on it hands your throughput to a third
+	// party — a four-per-minute VirusTotal key sharing a queue with the local
+	// scanners would cap the entire pipeline at four files per minute.
+	SpillScanners []string
+
+	// ScannerRatePerMin bounds requests for quota-limited scanners, keyed by
+	// scanner name.
+	ScannerRatePerMin map[string]float64
+
+	// PendingRetryBase is the first backoff step; each attempt doubles it.
+	PendingRetryBase time.Duration
+	// PendingMaxAttempts stops a task that keeps failing from being retried
+	// forever. Past it the task is marked failed and the failure is published,
+	// so it is visible rather than silently absent.
+	PendingMaxAttempts int
+
+	// --- threat intel ---
+
+	EnableVT bool
+	VTAPIKey string
+	// VTSeverityMedium and VTSeverityHigh are engine-count thresholds. One or
+	// two detections out of roughly seventy engines is routinely a heuristic
+	// false positive, so a single hit does not mean high.
+	VTSeverityMedium int
+	VTSeverityHigh   int
+	// VTDailyQuota stops the scanner before the provider does. Being cut off
+	// mid-run by a 429 wastes the lookups already spent; stopping early leaves
+	// the remainder parked for the next day.
+	VTDailyQuota int
+
+	// IntelCacheTTL bounds how long a third-party verdict is trusted. A file
+	// unknown last week may be documented malware today.
+	IntelCacheTTL time.Duration
+
 	// MetricsAddr serves /metrics. Empty disables the server.
 	MetricsAddr string
 }
@@ -117,7 +156,22 @@ func Load() *Config {
 		PublishMaxBytes:      getBytes("PUBLISH_MAX_BYTES", 5*MB),
 
 		StageQueueSize: getInt("STAGE_QUEUE_SIZE", 1000),
-		MetricsAddr:    getUnlessSet("METRICS_ADDR", ":8080"),
+
+		SpillScanners: getList("SPILL_SCANNERS", []string{"otx", "virustotal", "sandbox"}),
+		ScannerRatePerMin: map[string]float64{
+			"otx":        float64(getInt("OTX_RATE_PER_MIN", 600)),
+			"virustotal": float64(getInt("VT_RATE_PER_MIN", 4)), // free tier
+		},
+		PendingRetryBase:   getDuration("PENDING_RETRY_BASE", 30*time.Second),
+		PendingMaxAttempts: getInt("PENDING_MAX_ATTEMPTS", 5),
+
+		EnableVT:         os.Getenv("ENABLE_VT") == "true",
+		VTAPIKey:         os.Getenv("VT_API_KEY"),
+		VTSeverityMedium: getInt("VT_SEVERITY_MEDIUM", 3),
+		VTSeverityHigh:   getInt("VT_SEVERITY_HIGH", 10),
+		VTDailyQuota:     getInt("VT_DAILY_QUOTA", 500),
+		IntelCacheTTL:    getDuration("INTEL_CACHE_TTL", 168*time.Hour),
+		MetricsAddr:      getUnlessSet("METRICS_ADDR", ":8080"),
 	}
 }
 
@@ -140,6 +194,23 @@ func getUnlessSet(key, def string) string {
 		return val
 	}
 	return def
+}
+
+// getList reads a comma-separated setting. An explicitly empty value means an
+// empty list, not the default — SPILL_SCANNERS="" is how you say "nothing
+// spills".
+func getList(key string, def []string) []string {
+	raw, ok := os.LookupEnv(key)
+	if !ok {
+		return def
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if v := strings.TrimSpace(part); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // getInt reads an integer setting, falling back to def when unset or unparseable.

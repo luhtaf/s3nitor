@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"golang.org/x/sync/semaphore"
+	"golang.org/x/time/rate"
 )
 
 // Outcome reports how admitted work went.
@@ -148,6 +149,56 @@ func (l *ByteLimiter) Acquire(ctx context.Context, weight int64) (func(Outcome),
 		if once.CompareAndSwap(false, true) {
 			l.inFlight.Add(-weight)
 			l.bytes.Release(weight)
+		}
+	}, nil
+}
+
+// RateLimiter admits work at a fixed rate rather than a fixed concurrency.
+//
+// The right shape for a third-party API, where the constraint is requests per
+// unit of time and not how many are in flight. A VirusTotal free-tier key allows
+// four lookups per minute; expressing that as a concurrency limit would be
+// meaningless, since one request at a time is still far too many if they come
+// back quickly.
+type RateLimiter struct {
+	name     string
+	lim      *rate.Limiter
+	inFlight atomic.Int64
+	perSec   float64
+}
+
+// NewRateLimiter admits perSec requests per second, allowing a burst of one.
+//
+// A burst of one on purpose: a larger burst spends the quota immediately and
+// then stalls, which for a daily-capped API means running out early in the day
+// rather than pacing across it.
+func NewRateLimiter(name string, perSec float64) *RateLimiter {
+	if perSec <= 0 {
+		perSec = 1
+	}
+	return &RateLimiter{
+		name:   name,
+		lim:    rate.NewLimiter(rate.Limit(perSec), 1),
+		perSec: perSec,
+	}
+}
+
+func (l *RateLimiter) Name() string { return l.name }
+
+// Limit reports requests per minute, since that is the unit these quotas are
+// published in and a fractional per-second figure reads as noise.
+func (l *RateLimiter) Limit() int64    { return int64(l.perSec * 60) }
+func (l *RateLimiter) InFlight() int64 { return l.inFlight.Load() }
+
+func (l *RateLimiter) Acquire(ctx context.Context, _ int64) (func(Outcome), error) {
+	if err := l.lim.Wait(ctx); err != nil {
+		return nil, err
+	}
+	l.inFlight.Add(1)
+	var once atomic.Bool
+	return func(Outcome) {
+		if once.CompareAndSwap(false, true) {
+			l.inFlight.Add(-1)
 		}
 	}, nil
 }

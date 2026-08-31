@@ -11,6 +11,7 @@ import (
 
 	"github.com/luhtaf/s3nitor/internal/config"
 	"github.com/luhtaf/s3nitor/internal/db"
+	"github.com/luhtaf/s3nitor/internal/intel"
 	"github.com/luhtaf/s3nitor/internal/metrics"
 	"github.com/luhtaf/s3nitor/internal/pipeline"
 	"github.com/luhtaf/s3nitor/internal/reporter"
@@ -83,7 +84,13 @@ func run() error {
 	}
 	log.Printf("listed %d objects", len(objects))
 
-	p := pipeline.New(cfg, fetcher, scanner.NewEngine(cfg), rep, gdb, m, workDir)
+	// The threat-intel scanners are composed here rather than inside NewEngine:
+	// they need the cache, and wiring them in the scanner package would create
+	// an import cycle.
+	scanners := scanner.NewEngine(cfg).Scanners()
+	scanners = append(scanners, intel.NewOTX(cfg, gdb), intel.NewVirusTotal(cfg, gdb))
+
+	p := pipeline.New(cfg, fetcher, scanner.NewEngineWith(scanners...), rep, gdb, m, workDir)
 	summary, err := p.Run(ctx, objects)
 	if err != nil {
 		return err
@@ -112,13 +119,13 @@ func logSummary(s pipeline.Summary) {
 
 	peak, source, err := sysinfo.PeakRSS()
 	if err != nil {
-		log.Printf("run summary: listed=%d scanned=%d skipped=%d failed=%d duration=%s rate=%.1f/s peak_rss=unavailable (%v)",
-			s.Listed, s.Scanned, s.Skipped, s.Failed, s.Duration.Round(time.Millisecond), rate, err)
+		log.Printf("run summary: listed=%d scanned=%d skipped=%d failed=%d spilled=%d duration=%s rate=%.1f/s peak_rss=unavailable (%v)",
+			s.Listed, s.Scanned, s.Skipped, s.Failed, s.Spilled, s.Duration.Round(time.Millisecond), rate, err)
 		return
 	}
 
-	log.Printf("run summary: listed=%d scanned=%d skipped=%d failed=%d duration=%s rate=%.1f/s peak_rss=%d peak_rss_human=%s peak_rss_source=%s",
-		s.Listed, s.Scanned, s.Skipped, s.Failed,
+	log.Printf("run summary: listed=%d scanned=%d skipped=%d failed=%d spilled=%d duration=%s rate=%.1f/s peak_rss=%d peak_rss_human=%s peak_rss_source=%s",
+		s.Listed, s.Scanned, s.Skipped, s.Failed, s.Spilled,
 		s.Duration.Round(time.Millisecond), rate,
 		peak, humanBytes(peak), source)
 }

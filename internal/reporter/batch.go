@@ -13,5 +13,5 @@ import (
 // batch API — a file, a log line — does not have to pretend to have one. The
 // publish stage type-asserts for it and falls back to Report per document.
 type BatchReporter interface {
-	ReportBatch(ctx context.Context, batch []*scanner.FileResult) error
+	ReportBatch(ctx context.Context, batch []*scanner.Finding) error
 }

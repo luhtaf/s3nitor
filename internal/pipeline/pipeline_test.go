@@ -78,19 +78,66 @@ func (r *trackedReader) Close() error {
 	return nil
 }
 
+// fakeScanner stands in for a real scanner so a test can control exactly what
+// runs, whether it touches the payload, and how long it takes.
+type fakeScanner struct {
+	name        string
+	needsFile   bool
+	delay       time.Duration
+	calls       atomic.Int64
+	sawPayload  atomic.Int64
+	missingFile atomic.Int64
+}
+
+func (f *fakeScanner) Name() string         { return f.name }
+func (f *fakeScanner) Enabled() bool        { return true }
+func (f *fakeScanner) NeedsPayload() bool   { return f.needsFile }
+func (f *fakeScanner) RulesVersion() string { return "v1" }
+
+func (f *fakeScanner) Scan(_ context.Context, in *scanner.ScanInput) (scanner.Result, error) {
+	f.calls.Add(1)
+	if f.needsFile {
+		if _, err := os.Stat(in.LocalPath); err == nil {
+			f.sawPayload.Add(1)
+		} else {
+			// The payload was freed while a scanner that needs it was still
+			// running — a refcounting bug, and one that would otherwise show up
+			// only as mysteriously empty scan results.
+			f.missingFile.Add(1)
+		}
+	}
+	if f.delay > 0 {
+		time.Sleep(f.delay)
+	}
+	return scanner.Result{Match: false, Severity: scanner.SeverityInfo}, nil
+}
+
 // recordingReporter captures what the publish stage emitted.
 type recordingReporter struct {
 	mu      sync.Mutex
-	docs    []*scanner.FileResult
+	docs    []*scanner.Finding
 	batches atomic.Int64
 }
 
-func (r *recordingReporter) Report(_ context.Context, fr *scanner.FileResult) error {
+func (r *recordingReporter) Report(_ context.Context, f *scanner.Finding) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.docs = append(r.docs, fr)
+	r.docs = append(r.docs, f)
 	r.batches.Add(1)
 	return nil
+}
+
+// findingsFor counts documents produced by one scanner.
+func (r *recordingReporter) findingsFor(name string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, d := range r.docs {
+		if d.Scanner == name {
+			n++
+		}
+	}
+	return n
 }
 
 func (r *recordingReporter) count() int {
@@ -152,7 +199,7 @@ func TestByteBudgetBoundsBytesInFlight(t *testing.T) {
 
 	opener := &fakeOpener{sizes: sizes, delay: 2 * time.Millisecond}
 	rep := &recordingReporter{}
-	p := New(cfg, opener, scanner.NewEngine(&config.Config{}), rep, testDB(t), metrics.New(), t.TempDir())
+	p := New(cfg, opener, scanner.NewEngineWith(&fakeScanner{name: "test", needsFile: true}), rep, testDB(t), metrics.New(), t.TempDir())
 
 	if _, err := p.Run(context.Background(), objs); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -177,7 +224,7 @@ func TestObjectLargerThanBudgetStillCompletes(t *testing.T) {
 
 	opener := &fakeOpener{sizes: map[string]int64{"huge": 8192}}
 	rep := &recordingReporter{}
-	p := New(cfg, opener, scanner.NewEngine(&config.Config{}), rep, testDB(t), metrics.New(), t.TempDir())
+	p := New(cfg, opener, scanner.NewEngineWith(&fakeScanner{name: "test", needsFile: true}), rep, testDB(t), metrics.New(), t.TempDir())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -199,7 +246,7 @@ func TestMaxObjectSizeSkipsBeforeFetching(t *testing.T) {
 
 	opener := &fakeOpener{sizes: map[string]int64{"small": 100, "big": 5000}}
 	rep := &recordingReporter{}
-	p := New(cfg, opener, scanner.NewEngine(&config.Config{}), rep, testDB(t), metrics.New(), t.TempDir())
+	p := New(cfg, opener, scanner.NewEngineWith(&fakeScanner{name: "test", needsFile: true}), rep, testDB(t), metrics.New(), t.TempDir())
 
 	if _, err := p.Run(context.Background(), []s3fetcher.S3Object{
 		{Bucket: "b", Key: "small", ETag: "e1", Size: 100},
@@ -212,25 +259,27 @@ func TestMaxObjectSizeSkipsBeforeFetching(t *testing.T) {
 	if rep.count() != 2 {
 		t.Fatalf("published %d documents, want 2 (one scan, one coverage gap)", rep.count())
 	}
+	if got := rep.findingsFor("test"); got != 1 {
+		t.Errorf("the scanner produced %d findings, want 1", got)
+	}
 	if opener.peakBytes() > 100 {
 		t.Error("the oversized object was transferred despite being over the limit")
 	}
 
 	var gaps int
 	for _, doc := range rep.docs {
-		res, ok := doc.Results["size_gate"]
-		if !ok {
+		if doc.Scanner != "size_gate" {
 			continue
 		}
 		gaps++
 		if doc.Key != "big" {
 			t.Errorf("coverage gap reported for %q, want \"big\"", doc.Key)
 		}
-		if scanned, _ := res.Detail["scanned"].(bool); scanned {
+		if scanned, _ := doc.Detail["scanned"].(bool); scanned {
 			t.Error("coverage gap claims the object was scanned")
 		}
-		if got, _ := res.Detail["object_size"].(int64); got != 5000 {
-			t.Errorf("coverage gap object_size = %v, want 5000", res.Detail["object_size"])
+		if got, _ := doc.Detail["object_size"].(int64); got != 5000 {
+			t.Errorf("coverage gap object_size = %v, want 5000", doc.Detail["object_size"])
 		}
 	}
 	if gaps != 1 {
@@ -251,7 +300,7 @@ func TestSecondRunSkipsAlreadyScannedObjects(t *testing.T) {
 	sizes := map[string]int64{"a": 64, "c": 64}
 
 	first := &recordingReporter{}
-	p1 := New(cfg, &fakeOpener{sizes: sizes}, scanner.NewEngine(&config.Config{}), first, gdb, metrics.New(), t.TempDir())
+	p1 := New(cfg, &fakeOpener{sizes: sizes}, scanner.NewEngineWith(&fakeScanner{name: "test", needsFile: true}), first, gdb, metrics.New(), t.TempDir())
 	if _, err := p1.Run(context.Background(), objs); err != nil {
 		t.Fatalf("first run: %v", err)
 	}
@@ -261,7 +310,7 @@ func TestSecondRunSkipsAlreadyScannedObjects(t *testing.T) {
 
 	second := &recordingReporter{}
 	opener2 := &fakeOpener{sizes: sizes}
-	p2 := New(cfg, opener2, scanner.NewEngine(&config.Config{}), second, gdb, metrics.New(), t.TempDir())
+	p2 := New(cfg, opener2, scanner.NewEngineWith(&fakeScanner{name: "test", needsFile: true}), second, gdb, metrics.New(), t.TempDir())
 	if _, err := p2.Run(context.Background(), objs); err != nil {
 		t.Fatalf("second run: %v", err)
 	}
@@ -274,7 +323,7 @@ func TestSecondRunSkipsAlreadyScannedObjects(t *testing.T) {
 
 	// A changed ETag is a different version, so it must be scanned again.
 	third := &recordingReporter{}
-	p3 := New(cfg, &fakeOpener{sizes: sizes}, scanner.NewEngine(&config.Config{}), third, gdb, metrics.New(), t.TempDir())
+	p3 := New(cfg, &fakeOpener{sizes: sizes}, scanner.NewEngineWith(&fakeScanner{name: "test", needsFile: true}), third, gdb, metrics.New(), t.TempDir())
 	if _, err := p3.Run(context.Background(), []s3fetcher.S3Object{
 		{Bucket: "b", Key: "a", ETag: "CHANGED", Size: 64},
 	}); err != nil {
@@ -301,7 +350,7 @@ func TestPartialBatchIsFlushedOnShutdown(t *testing.T) {
 	}
 
 	rep := &recordingReporter{}
-	p := New(cfg, &fakeOpener{sizes: sizes}, scanner.NewEngine(&config.Config{}), rep, testDB(t), metrics.New(), t.TempDir())
+	p := New(cfg, &fakeOpener{sizes: sizes}, scanner.NewEngineWith(&fakeScanner{name: "test", needsFile: true}), rep, testDB(t), metrics.New(), t.TempDir())
 
 	if _, err := p.Run(context.Background(), objs); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -344,7 +393,7 @@ func TestBudgetCoversDiskResidencyNotJustTransfer(t *testing.T) {
 	workDir := t.TempDir()
 	rep := &recordingReporter{}
 	p := New(cfg, &fakeOpener{sizes: sizes, delay: time.Millisecond},
-		scanner.NewEngine(&config.Config{}), rep, testDB(t), metrics.New(), workDir)
+		scanner.NewEngineWith(&fakeScanner{name: "test", needsFile: true}), rep, testDB(t), metrics.New(), workDir)
 
 	// Watch the work directory while the run proceeds.
 	var peakFiles int64
@@ -385,5 +434,148 @@ func TestBudgetCoversDiskResidencyNotJustTransfer(t *testing.T) {
 	}
 	if left, _ := os.ReadDir(workDir); len(left) != 0 {
 		t.Errorf("%d payloads left behind", len(left))
+	}
+}
+
+// One object, several scanners: each verdict is published on its own, and the
+// payload survives until the last scanner that reads it is finished.
+func TestEachScannerPublishesItsOwnFinding(t *testing.T) {
+	cfg := testConfig()
+
+	fast := &fakeScanner{name: "fast", needsFile: false}
+	slow := &fakeScanner{name: "slow", needsFile: true, delay: 5 * time.Millisecond}
+	other := &fakeScanner{name: "other", needsFile: true}
+
+	const objects = 6
+	sizes := map[string]int64{}
+	var objs []s3fetcher.S3Object
+	for i := 0; i < objects; i++ {
+		key := fmt.Sprintf("k%02d", i)
+		sizes[key] = 128
+		objs = append(objs, s3fetcher.S3Object{Bucket: "b", Key: key, ETag: key, Size: 128})
+	}
+
+	workDir := t.TempDir()
+	rep := &recordingReporter{}
+	p := New(cfg, &fakeOpener{sizes: sizes},
+		scanner.NewEngineWith(fast, slow, other), rep, testDB(t), metrics.New(), workDir)
+
+	if _, err := p.Run(context.Background(), objs); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if got := rep.count(); got != objects*3 {
+		t.Errorf("published %d documents, want %d (one per object per scanner)", got, objects*3)
+	}
+	for _, s := range []*fakeScanner{fast, slow, other} {
+		if got := rep.findingsFor(s.name); got != objects {
+			t.Errorf("scanner %q produced %d findings, want %d", s.name, got, objects)
+		}
+	}
+
+	// The refcount has to hold the file for every scanner that reads it, not
+	// just the first one to finish.
+	for _, s := range []*fakeScanner{slow, other} {
+		if n := s.missingFile.Load(); n != 0 {
+			t.Errorf("scanner %q found the payload already deleted %d times", s.name, n)
+		}
+		if got := s.sawPayload.Load(); got != objects {
+			t.Errorf("scanner %q saw the payload %d times, want %d", s.name, got, objects)
+		}
+	}
+
+	if p.byteLimiter.InFlight() != 0 {
+		t.Errorf("byte budget leaked %d bytes", p.byteLimiter.InFlight())
+	}
+	if left, _ := os.ReadDir(workDir); len(left) != 0 {
+		t.Errorf("%d payloads left behind", len(left))
+	}
+}
+
+// A quota-bound scanner must not hold up the local ones. Its lane is rate
+// limited and spills when the queue backs up, so the fast scanners finish while
+// the slow one is parked for later.
+func TestSpillLaneDoesNotBlockLocalScanners(t *testing.T) {
+	cfg := testConfig()
+	cfg.SpillScanners = []string{"quota"}
+	cfg.ScannerRatePerMin = map[string]float64{"quota": 1} // one per minute
+	cfg.StageQueueSize = 2                                 // fills almost immediately
+
+	local := &fakeScanner{name: "local", needsFile: true}
+	quota := &fakeScanner{name: "quota", needsFile: false}
+
+	const objects = 20
+	sizes := map[string]int64{}
+	var objs []s3fetcher.S3Object
+	for i := 0; i < objects; i++ {
+		key := fmt.Sprintf("q%02d", i)
+		sizes[key] = 64
+		objs = append(objs, s3fetcher.S3Object{Bucket: "b", Key: key, ETag: key, Size: 64})
+	}
+
+	gdb := testDB(t)
+	rep := &recordingReporter{}
+	p := New(cfg, &fakeOpener{sizes: sizes},
+		scanner.NewEngineWith(local, quota), rep, gdb, metrics.New(), t.TempDir())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	summary, err := p.Run(ctx, objs)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// The local scanner is unaffected by the other lane's quota.
+	if got := rep.findingsFor("local"); got != objects {
+		t.Errorf("local scanner produced %d findings, want %d", got, objects)
+	}
+
+	// At one request per minute the quota lane cannot have run them all, so most
+	// must have been parked rather than dropped or waited on.
+	if summary.Spilled == 0 {
+		t.Fatal("nothing spilled — the quota lane blocked instead of parking work")
+	}
+
+	var pending int64
+	if err := gdb.Model(&db.ScanTask{}).
+		Where("scanner = ? AND status = ?", "quota", db.StatusPending).
+		Count(&pending).Error; err != nil {
+		t.Fatalf("counting pending: %v", err)
+	}
+	if pending == 0 {
+		t.Error("spilled tasks were not durable — nothing in scan_tasks")
+	}
+	t.Logf("local=%d quota=%d spilled=%d pending_rows=%d",
+		rep.findingsFor("local"), rep.findingsFor("quota"), summary.Spilled, pending)
+}
+
+// A spilled task is claimable afterwards, with its lease and attempt count
+// tracked — that is what lets a later run finish the work.
+func TestPendingTasksAreClaimable(t *testing.T) {
+	gdb := testDB(t)
+
+	if err := db.EnqueuePending(gdb, "file-1", "virustotal", "v1", -time.Minute); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	claimed, err := db.ClaimPending(gdb, "instance-a", time.Minute, 10)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed %d tasks, want 1", len(claimed))
+	}
+	if claimed[0].Attempts != 1 {
+		t.Errorf("attempts = %d, want 1", claimed[0].Attempts)
+	}
+
+	// Already leased, so a second instance must not take the same work.
+	again, err := db.ClaimPending(gdb, "instance-b", time.Minute, 10)
+	if err != nil {
+		t.Fatalf("second claim: %v", err)
+	}
+	if len(again) != 0 {
+		t.Errorf("a live lease was stolen: %d tasks claimed", len(again))
 	}
 }

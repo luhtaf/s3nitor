@@ -3,12 +3,16 @@ package scanner
 import (
 	"context"
 	"log"
-	"time"
 
 	"github.com/luhtaf/s3nitor/internal/config"
 )
 
-// NewEngine registers the scanners enabled by config.
+// NewEngine registers the scanners that need nothing beyond config.
+//
+// The threat-intel scanners are not built here: they need the cache, which lives
+// in db, and putting them under this package would force scanner to import intel
+// while intel imports scanner for this interface. The caller composes the full
+// set with NewEngineWith.
 //
 // Registration order no longer matters. It used to: HashScanner had to come
 // first because IOC and OTX read the hashes it left in the shared context.
@@ -20,53 +24,31 @@ func NewEngine(cfg *config.Config) *Engine {
 	if cfg.EnableIOC {
 		e.scanners = append(e.scanners, NewIOCScanner(cfg))
 	}
-	if cfg.EnableOTX {
-		e.scanners = append(e.scanners, NewOTXScanner(cfg))
-	}
 	if cfg.EnableYara {
 		e.scanners = append(e.scanners, NewYaraScanner(cfg))
 	}
 	return e
 }
 
-// ProcessFile runs every enabled scanner over one object and collects the
-// verdicts.
+// ScanOne runs a single scanner and returns its published verdict.
 //
-// Collecting here is a temporary arrangement. The staged pipeline publishes each
-// scanner's result independently, at which point this function disappears along
-// with FileResult.
-//
-// The outer envelope the reporters emit is unchanged, but the contents of
-// "results" are not: each scanner used to invent its own keys ("ioc_match",
-// "yara_match", "otx_match") inside an untyped map, so no consumer could ask
-// "did anything match?" without knowing every scanner by name. Every entry is
-// now the same {match, severity, detail} shape. Scanner names lost their
-// "_scanner" suffix to match. Anything parsing the old output needs updating.
-//
-// A failing scanner is logged and skipped rather than aborting the others: one
-// unreachable API should not cost you the YARA verdict.
-func (e *Engine) ProcessFile(ctx context.Context, in *ScanInput) *FileResult {
-	out := &FileResult{
-		FileID:   in.FileID,
-		Bucket:   in.Bucket,
-		Key:      in.Key,
-		Version:  in.Version,
-		Size:     in.Size,
-		Hashes:   in.Hashes,
-		Results:  make(map[string]Result, len(e.scanners)),
-		ScanTime: time.Now().UTC(),
+// A scanner failure becomes a Finding carrying the error rather than a dropped
+// result. The old ProcessFile logged the error and moved on, which left no trace
+// once the pod was gone — and for a security scanner, "this check did not run"
+// has to be as visible as "this check found nothing".
+func ScanOne(ctx context.Context, s Scanner, in *ScanInput) *Finding {
+	res, err := s.Scan(ctx, in)
+	if err != nil {
+		log.Printf("[%s] %s: %v", s.Name(), in.Key, err)
 	}
+	return NewFinding(in, s, res, err)
+}
 
-	for _, s := range e.scanners {
-		if !s.Enabled() {
-			continue
-		}
-		res, err := s.Scan(ctx, in)
-		if err != nil {
-			log.Printf("[%s] error: %v", s.Name(), err)
-			continue
-		}
-		out.Results[s.Name()] = res
-	}
-	return out
+// NewEngineWith builds an engine from an explicit scanner set.
+//
+// For tests and for callers that assemble the set themselves; NewEngine reads
+// the config, which is the wrong seam when the point is to control exactly which
+// scanners run.
+func NewEngineWith(scanners ...Scanner) *Engine {
+	return &Engine{scanners: scanners}
 }

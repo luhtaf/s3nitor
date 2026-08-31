@@ -2,6 +2,8 @@ package scanner
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"time"
 )
 
@@ -72,22 +74,77 @@ type Scanner interface {
 	Scan(ctx context.Context, in *ScanInput) (Result, error)
 }
 
-// FileResult carries one object's identity together with every scanner's
-// verdict on it.
+// Finding is one scanner's verdict on one object — the unit that gets published.
 //
-// This exists only while the single worker loop is still in place: it collects
-// what used to accumulate in the shared ScanContext so the reporters keep
-// emitting the same envelope as before. Once the staged pipeline lands, each
-// scanner result is published on its own and there is nothing left to collect.
-type FileResult struct {
-	FileID   string
-	Bucket   string
-	Key      string
-	Version  string
-	Size     int64
-	Hashes   map[string]string
-	Results  map[string]Result
-	ScanTime time.Time
+// This replaces the per-file envelope that FileResult used to carry. Scanners
+// finish at wildly different times: an IOC lookup returns in microseconds while
+// a VirusTotal query may wait hours behind a quota, so "the result for this
+// file" is not a thing that exists at any single moment. Publishing each verdict
+// on its own means a slow scanner never holds back a fast one, and the sink —
+// which is a document store — reassembles them at query time on FileID.
+type Finding struct {
+	FileID  string            `json:"file_id"`
+	Bucket  string            `json:"bucket"`
+	Key     string            `json:"key"`
+	Version string            `json:"version"`
+	Size    int64             `json:"size"`
+	Hashes  map[string]string `json:"hashes,omitempty"`
+
+	Scanner string `json:"scanner"`
+	// RulesVersion identifies the ruleset behind this verdict, so a later
+	// ruleset change produces a new document rather than overwriting the old
+	// one, and history is preserved.
+	RulesVersion string `json:"rules_version,omitempty"`
+
+	Match    bool           `json:"match"`
+	Severity Severity       `json:"severity"`
+	Detail   map[string]any `json:"detail,omitempty"`
+
+	ScannedAt time.Time `json:"scanned_at"`
+	// Error is set when the scanner failed rather than returned a verdict. A
+	// failure that vanishes silently is indistinguishable from a clean result,
+	// which for a security scanner is the worse of the two.
+	Error string `json:"error,omitempty"`
+}
+
+// NewFinding builds a published verdict from an input and a scanner's result.
+func NewFinding(in *ScanInput, s Scanner, res Result, scanErr error) *Finding {
+	f := &Finding{
+		FileID:       in.FileID,
+		Bucket:       in.Bucket,
+		Key:          in.Key,
+		Version:      in.Version,
+		Size:         in.Size,
+		Hashes:       in.Hashes,
+		Scanner:      s.Name(),
+		RulesVersion: s.RulesVersion(),
+		Match:        res.Match,
+		Severity:     res.Severity,
+		Detail:       res.Detail,
+		ScannedAt:    time.Now().UTC(),
+	}
+	if scanErr != nil {
+		f.Error = scanErr.Error()
+		f.Severity = SeverityInfo
+	}
+	if f.Severity == "" {
+		f.Severity = SeverityInfo
+	}
+	return f
+}
+
+// DocID is a deterministic identifier for this finding.
+//
+// At-least-once delivery means the same verdict is occasionally published twice
+// — after a crash between publishing and recording, for instance. A derived id
+// turns that replay into an overwrite instead of a duplicate, which is what
+// makes crash recovery correct rather than merely tidy.
+//
+// RulesVersion is part of it on purpose: rescanning after a ruleset change is a
+// new fact, not a correction of the old one, so it gets its own document.
+func (f *Finding) DocID() string {
+	sum := sha256.Sum256([]byte(f.FileID + "\x00" + f.Scanner + "\x00" + f.RulesVersion))
+	return hex.EncodeToString(sum[:])
 }
 
 // Engine holds the registered scanners.

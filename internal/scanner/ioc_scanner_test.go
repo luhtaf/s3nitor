@@ -116,13 +116,12 @@ func TestIOCRulesVersion(t *testing.T) {
 	}
 }
 
-// NeedsPayload gates whether a retry has to download the object again.
+// NeedsPayload gates two things: whether a retried task has to download the
+// object again, and whether the payload's refcount holds the temp file open for
+// this scanner.
 func TestScannerPayloadRequirements(t *testing.T) {
 	if newTestIOC(nil, nil, nil).NeedsPayload() {
 		t.Error("IOC reads only hashes, so it must not require the payload")
-	}
-	if (&OTXScanner{}).NeedsPayload() {
-		t.Error("OTX reads only the sha256, so it must not require the payload")
 	}
 	if !(&YARAScanner{}).NeedsPayload() {
 		t.Error("YARA reads the file, so it must require the payload")

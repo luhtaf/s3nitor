@@ -40,16 +40,6 @@ type ObjectOpener interface {
 	Open(ctx context.Context, key string) (io.ReadCloser, error)
 }
 
-// scanJob carries an input together with the byte budget it still holds.
-//
-// The release travels with the payload because whoever deletes the temp file is
-// the only one who can honestly say the bytes are gone — and that is the analyze
-// stage, not fetch.
-type scanJob struct {
-	in      *scanner.ScanInput
-	release func(Outcome)
-}
-
 // Summary is what one run did, logged at exit so a benchmark harness can read
 // it back without scraping a metrics endpoint that dies with the process.
 type Summary struct {
@@ -57,6 +47,7 @@ type Summary struct {
 	Scanned  int
 	Skipped  int
 	Failed   int
+	Spilled  int
 	Duration time.Duration
 }
 
@@ -66,20 +57,19 @@ type job struct {
 	fileID string
 }
 
-// Pipeline runs the scan as four stages connected by bounded channels.
+// Pipeline runs the scan as stages connected by bounded channels.
 //
-//	discover ─► fetch+hash ─► analyze ─► publish
-//	   1 goroutine   bytes      cores     batched
+//	discover ─► fetch+hash ─► dispatch ─┬─► ioc ────────┐
+//	                                    ├─► yara ───────┼─► publish
+//	                                    └─► virustotal ─┘
 //
 // The boundaries follow one rule: a stage exists to separate different resource
 // profiles. Discovery waits on pagination, fetch on the network while holding
-// bytes on disk, analysis on CPU, publishing on the sink. Sharing one bound
-// across all four means choosing for the worst case.
+// bytes, the local scanners on CPU, the intel scanners on somebody else's quota.
+// Sharing one bound across all of them means choosing for the worst case.
 //
-// The channels are bounded deliberately. A full channel is what makes a slow
-// stage push back on a fast one, which is why the byte budget in fetch ends up
-// governing the whole pipeline: when everything downstream stalls, fetch stops
-// being admitted, and discovery blocks behind it.
+// The channels are bounded deliberately: a full channel is what makes a slow
+// stage push back on a fast one.
 type Pipeline struct {
 	cfg     *config.Config
 	fetcher ObjectOpener
@@ -88,25 +78,28 @@ type Pipeline struct {
 	gdb     *gorm.DB
 	m       *metrics.Metrics
 
-	// byteLimiter is the global brake. It is held from the moment a transfer
-	// starts until the payload is deleted after scanning, because the bytes are
-	// resident for that whole span — first in network buffers, then on disk.
-	// Releasing it when the transfer ended, as an earlier version did, meant
-	// fetch never backed off: it filled the channel and the disk while the
-	// accounting claimed the budget was free.
 	scanned atomic.Int64
 	skipped atomic.Int64
 	failed  atomic.Int64
+	spilled atomic.Int64
 
+	// byteLimiter is the global brake. It is held from the moment a transfer
+	// starts until the payload is deleted after scanning, because the bytes are
+	// resident for that whole span — first in network buffers, then on disk.
 	byteLimiter *ByteLimiter
 	// connLimiter bounds concurrent transfers, a shorter span and a different
 	// resource.
-	connLimiter    *FixedLimiter
-	analyzeLimiter *FixedLimiter
-	workDir        string
+	connLimiter *FixedLimiter
+	// cpuLimiter is shared by every local scanner lane. One limiter rather than
+	// one per lane: separate GOMAXPROCS budgets would permit a multiple of the
+	// intended parallelism.
+	cpuLimiter *FixedLimiter
+
+	lanes   map[string]*lane
+	workDir string
 }
 
-// New builds a pipeline and its limiters.
+// New builds a pipeline, its limiters and one lane per enabled scanner.
 func New(
 	cfg *config.Config,
 	fetcher ObjectOpener,
@@ -118,83 +111,97 @@ func New(
 ) *Pipeline {
 	cpu := cfg.AnalyzeCPULimit
 	if cpu <= 0 {
-		// For CPU-bound work there is no better number than the number of cores
-		// available: past that, extra goroutines add context switching and no
-		// throughput.
+		// For CPU-bound work there is no better number than the cores available:
+		// past that, extra goroutines add context switching and no throughput.
 		cpu = runtime.GOMAXPROCS(0)
 	}
 
 	p := &Pipeline{
 		cfg: cfg, fetcher: fetcher, engine: engine, rep: rep, gdb: gdb, m: m,
-		workDir:        workDir,
-		byteLimiter:    NewByteLimiter("bytes", cfg.FetchByteBudget),
-		connLimiter:    NewFixedLimiter("conns", cfg.FetchMaxConns),
-		analyzeLimiter: NewFixedLimiter(stageAnalyze, cpu),
+		workDir:     workDir,
+		byteLimiter: NewByteLimiter("bytes", cfg.FetchByteBudget),
+		connLimiter: NewFixedLimiter("conns", cfg.FetchMaxConns),
+		cpuLimiter:  NewFixedLimiter("cpu", cpu),
 	}
 
 	m.WatchLimiter(p.byteLimiter)
 	m.WatchLimiter(p.connLimiter)
-	m.WatchLimiter(p.analyzeLimiter)
+	m.WatchLimiter(p.cpuLimiter)
 
-	log.Printf("pipeline: fetch budget %d bytes over %d conns, analyze %d workers, publish batch %d / %s",
-		cfg.FetchByteBudget, cfg.FetchMaxConns, cpu, cfg.PublishBatchSize, cfg.PublishFlushInterval)
+	p.lanes = buildLanes(cfg, engine.Scanners(), p.cpuLimiter, m)
+
+	log.Printf("pipeline: byte budget %d over %d conns, cpu %d, %d lanes, publish batch %d / %s",
+		cfg.FetchByteBudget, cfg.FetchMaxConns, cpu, len(p.lanes),
+		cfg.PublishBatchSize, cfg.PublishFlushInterval)
 	return p
 }
 
 // Run pushes every object through the pipeline and returns once the last
-// document has been published.
+// finding has been published.
 func (p *Pipeline) Run(ctx context.Context, objects []s3fetcher.S3Object) (Summary, error) {
 	started := time.Now()
+
 	jobs := make(chan job, p.cfg.StageQueueSize)
-	inputs := make(chan *scanJob, p.cfg.StageQueueSize)
-	results := make(chan *scanner.FileResult, p.cfg.StageQueueSize)
+	payloads := make(chan *payload, p.cfg.StageQueueSize)
+	findings := make(chan *scanner.Finding, p.cfg.StageQueueSize)
 
 	stopSampling := p.sampleQueueDepth(map[string]func() int{
 		stageFetch:   func() int { return len(jobs) },
-		stageAnalyze: func() int { return len(inputs) },
-		stagePublish: func() int { return len(results) },
+		stageAnalyze: func() int { return len(payloads) },
+		stagePublish: func() int { return len(findings) },
 	})
 	defer stopSampling()
 
-	var fetchWG, analyzeWG, publishWG sync.WaitGroup
+	var fetchWG, dispatchWG, laneWG, publishWG sync.WaitGroup
 
-	// Fetch: one goroutine per connection slot; the byte budget decides how many
-	// of them may hold data at once.
 	for i := 0; i < p.cfg.FetchMaxConns; i++ {
 		fetchWG.Add(1)
 		go func() {
 			defer fetchWG.Done()
-			p.runFetch(ctx, jobs, inputs)
+			p.runFetch(ctx, jobs, payloads)
 		}()
 	}
 
-	// Analyze: one goroutine per core.
-	for i := 0; i < int(p.analyzeLimiter.Limit()); i++ {
-		analyzeWG.Add(1)
-		go func() {
-			defer analyzeWG.Done()
-			p.runAnalyze(ctx, inputs, results)
-		}()
+	// A single dispatcher: fanning one payload out to every lane is bookkeeping,
+	// not work, and one owner makes the reference counting easy to follow.
+	dispatchWG.Add(1)
+	go func() {
+		defer dispatchWG.Done()
+		p.runDispatch(ctx, payloads, findings)
+	}()
+
+	for _, l := range p.lanes {
+		for i := 0; i < l.workers; i++ {
+			laneWG.Add(1)
+			go func(l *lane) {
+				defer laneWG.Done()
+				p.runLane(ctx, l, findings)
+			}(l)
+		}
 	}
 
-	// Publish: exactly one goroutine. Batching needs a single owner of the
-	// buffer, and it also removes the old bug where every worker appended to the
-	// same JSON file without a lock.
+	// Exactly one publisher. Batching needs a single owner of the buffer, and it
+	// also removes by construction the old bug where every worker appended to
+	// the same file without a lock.
 	publishWG.Add(1)
 	go func() {
 		defer publishWG.Done()
-		p.runPublish(ctx, results)
+		p.runPublish(ctx, findings)
 	}()
 
-	err := p.runDiscover(ctx, objects, jobs, results)
+	err := p.runDiscover(ctx, objects, jobs, findings)
 
-	// Close in order, waiting each time: a stage may only stop once nothing can
+	// Closed in order, waiting each time: a stage may only stop once nothing can
 	// still arrive for it.
 	close(jobs)
 	fetchWG.Wait()
-	close(inputs)
-	analyzeWG.Wait()
-	close(results)
+	close(payloads)
+	dispatchWG.Wait()
+	for _, l := range p.lanes {
+		close(l.in)
+	}
+	laneWG.Wait()
+	close(findings)
 	publishWG.Wait()
 
 	return Summary{
@@ -202,6 +209,7 @@ func (p *Pipeline) Run(ctx context.Context, objects []s3fetcher.S3Object) (Summa
 		Scanned:  int(p.scanned.Load()),
 		Skipped:  int(p.skipped.Load()),
 		Failed:   int(p.failed.Load()),
+		Spilled:  int(p.spilled.Load()),
 		Duration: time.Since(started),
 	}, err
 }
@@ -210,7 +218,7 @@ func (p *Pipeline) Run(ctx context.Context, objects []s3fetcher.S3Object) (Summa
 //
 // Dedup is one batched query rather than one per object: discovery holds whole
 // pages, so a thousand objects cost one round trip instead of a thousand.
-func (p *Pipeline) runDiscover(ctx context.Context, objects []s3fetcher.S3Object, out chan<- job, notices chan<- *scanner.FileResult) error {
+func (p *Pipeline) runDiscover(ctx context.Context, objects []s3fetcher.S3Object, out chan<- job, notices chan<- *scanner.Finding) error {
 	started := time.Now()
 
 	ids := make([]string, len(objects))
@@ -243,9 +251,7 @@ func (p *Pipeline) runDiscover(ctx context.Context, objects []s3fetcher.S3Object
 
 			// Not scanning something is itself worth reporting. The largest
 			// objects in a bucket are exactly where something would be hidden,
-			// and a log line plus a counter disappears the moment the pod does.
-			// Publishing the gap puts it in the same index as real findings, so
-			// the alerting that already watches that index catches it too.
+			// and a log line plus a counter disappears with the pod.
 			select {
 			case notices <- coverageGap(obj, ids[i], "exceeds_max_object_size", p.cfg.MaxObjectSize):
 			case <-ctx.Done():
@@ -267,43 +273,155 @@ func (p *Pipeline) runDiscover(ctx context.Context, objects []s3fetcher.S3Object
 	return nil
 }
 
-// coverageGap builds a document recording that an object was deliberately not
-// scanned.
+// coverageGap records that an object was deliberately not scanned.
 //
 // Match is false because nothing was detected — nothing was looked at. The gap
 // is carried by scanned:false in the detail instead, so a dashboard can ask for
 // coverage holes separately from detections.
 //
-// Deliberately no FileRecord is written for these. Leaving the object unrecorded
+// No FileRecord is written for these on purpose: leaving the object unrecorded
 // means raising MAX_OBJECT_SIZE later picks it up on the next run rather than
-// skipping it forever as "already handled". Republishing the same notice each
-// run is harmless where the sink keys on a deterministic document id.
-func coverageGap(obj s3fetcher.S3Object, fileID, reason string, limit int64) *scanner.FileResult {
-	return &scanner.FileResult{
-		FileID:  fileID,
-		Bucket:  obj.Bucket,
-		Key:     obj.Key,
-		Version: obj.ETag,
-		Size:    obj.Size,
-		Hashes:  map[string]string{}, // never fetched, so nothing was hashed
-		Results: map[string]scanner.Result{
-			"size_gate": {
-				Match:    false,
-				Severity: scanner.SeverityLow,
-				Detail: map[string]any{
-					"scanned":     false,
-					"reason":      reason,
-					"object_size": obj.Size,
-					"limit":       limit,
-				},
-			},
+// skipping it forever as already handled.
+func coverageGap(obj s3fetcher.S3Object, fileID, reason string, limit int64) *scanner.Finding {
+	return &scanner.Finding{
+		FileID:   fileID,
+		Bucket:   obj.Bucket,
+		Key:      obj.Key,
+		Version:  obj.ETag,
+		Size:     obj.Size,
+		Scanner:  "size_gate",
+		Match:    false,
+		Severity: scanner.SeverityLow,
+		Detail: map[string]any{
+			"scanned":     false,
+			"reason":      reason,
+			"object_size": obj.Size,
+			"limit":       limit,
 		},
-		ScanTime: time.Now().UTC(),
+		ScannedAt: time.Now().UTC(),
 	}
 }
 
+// payload is a fetched object plus the resources it is holding.
+//
+// Several scanners run over the same file, so neither the temp file nor the byte
+// budget can be released by whichever finishes first. refs counts the scanners
+// that actually read the bytes; the last one out deletes the file and hands the
+// budget back.
+type payload struct {
+	in      *scanner.ScanInput
+	refs    atomic.Int32
+	release func(Outcome)
+	once    sync.Once
+}
+
+// done marks one payload-reading scanner as finished with the file.
+//
+// Called on every exit path, including spills and cancellation. Missing one
+// leaks a temp file and, worse, leaks byte budget: a budget held by reservations
+// nobody returns never issues another token, and fetch stops for good.
+func (p *payload) done() {
+	if p.refs.Add(-1) <= 0 {
+		p.free()
+	}
+}
+
+func (p *payload) free() {
+	p.once.Do(func() {
+		if p.in.LocalPath != "" {
+			os.Remove(p.in.LocalPath)
+		}
+		p.release(Outcome{})
+	})
+}
+
+// task is one unit of scanning work: a single scanner against a single object.
+//
+// This is the unit the whole redesign converges on. A file is never simply
+// "scanned" when an IOC lookup returns in microseconds and a VirusTotal query
+// waits hours behind a quota, so the schedulable thing is the pair.
+type task struct {
+	payload *payload
+	scanner scanner.Scanner
+}
+
+// fullPolicy decides what happens when a lane's queue is full.
+type fullPolicy int
+
+const (
+	// policyBlock pushes back on the stage upstream. Correct when the wait is
+	// short — CPU saturation clears in seconds, and slowing intake is honest.
+	policyBlock fullPolicy = iota
+	// policySpill writes the task to the pending store and moves on. Correct
+	// when the wait is unbounded: blocking on an API quota lets a third party
+	// set the throughput of the entire pipeline.
+	policySpill
+)
+
+// lane is one scanner's queue, limiter and full-queue policy.
+type lane struct {
+	scanner scanner.Scanner
+	in      chan *task
+	limiter Limiter
+	policy  fullPolicy
+	workers int
+}
+
+// buildLanes gives each scanner its own queue and the limiter that matches what
+// it actually waits on.
+//
+// Local scanners share one CPU limiter rather than getting one each: two lanes
+// with GOMAXPROCS apiece would permit twice the intended parallelism, which is
+// how a CPU bound quietly stops being a bound.
+func buildLanes(cfg *config.Config, scanners []scanner.Scanner, cpu Limiter, m *metrics.Metrics) map[string]*lane {
+	spills := make(map[string]bool, len(cfg.SpillScanners))
+	for _, name := range cfg.SpillScanners {
+		spills[name] = true
+	}
+
+	lanes := make(map[string]*lane, len(scanners))
+	for _, sc := range scanners {
+		if !sc.Enabled() {
+			continue
+		}
+
+		l := &lane{
+			scanner: sc,
+			in:      make(chan *task, cfg.StageQueueSize),
+			limiter: cpu,
+			policy:  policyBlock,
+			workers: int(cpu.Limit()),
+		}
+
+		if spills[sc.Name()] {
+			perMin := cfg.ScannerRatePerMin[sc.Name()]
+			if perMin <= 0 {
+				perMin = 60
+			}
+			l.limiter = NewRateLimiter(sc.Name(), perMin/60)
+			l.policy = policySpill
+			// One worker is enough: the rate limiter, not the worker count,
+			// decides how fast this lane moves.
+			l.workers = 1
+			m.WatchLimiter(l.limiter)
+		}
+
+		lanes[sc.Name()] = l
+		log.Printf("lane %s: limiter=%s policy=%s workers=%d",
+			sc.Name(), l.limiter.Name(), policyName(l.policy), l.workers)
+	}
+	return lanes
+}
+
+func policyName(p fullPolicy) string {
+	if p == policySpill {
+		return "spill"
+	}
+	return "block"
+}
+
 // runFetch downloads objects, hashing them on the way through.
-func (p *Pipeline) runFetch(ctx context.Context, in <-chan job, out chan<- *scanJob) {
+func (p *Pipeline) runFetch(ctx context.Context, in <-chan job, out chan<- *payload) {
 	for j := range in {
 		select {
 		case <-ctx.Done():
@@ -312,7 +430,7 @@ func (p *Pipeline) runFetch(ctx context.Context, in <-chan job, out chan<- *scan
 		}
 
 		started := time.Now()
-		sj, err := p.fetchOne(ctx, j)
+		pl, err := p.fetchOne(ctx, j)
 		p.m.ObserveStage(stageFetch, started, err)
 		if err != nil {
 			log.Printf("fetch %s: %v", j.obj.Key, err)
@@ -321,12 +439,11 @@ func (p *Pipeline) runFetch(ctx context.Context, in <-chan job, out chan<- *scan
 		}
 
 		select {
-		case out <- sj:
+		case out <- pl:
 		case <-ctx.Done():
 			// Blocking here while holding the budget is the backpressure
 			// working. On the way out it still has to be handed back.
-			os.Remove(sj.in.LocalPath)
-			sj.release(Outcome{Err: ctx.Err()})
+			pl.free()
 			return
 		}
 	}
@@ -334,9 +451,9 @@ func (p *Pipeline) runFetch(ctx context.Context, in <-chan job, out chan<- *scan
 
 // fetchOne reserves budget for the object, streams it to disk and hashes it in
 // the same pass.
-func (p *Pipeline) fetchOne(ctx context.Context, j job) (*scanJob, error) {
+func (p *Pipeline) fetchOne(ctx context.Context, j job) (*payload, error) {
 	// The object's size is the weight. This reservation outlives the function:
-	// it travels to the analyze stage and is released once the payload is gone.
+	// it travels with the payload and is released once the file is gone.
 	releaseBytes, err := p.byteLimiter.Acquire(ctx, j.obj.Size)
 	if err != nil {
 		return nil, err
@@ -362,8 +479,7 @@ func (p *Pipeline) fetchOne(ctx context.Context, j job) (*scanJob, error) {
 		}
 		releaseConn(Outcome{Err: err, Latency: time.Since(start)})
 	}
-	// fail hands everything back, for the paths that produce no payload.
-	fail := func(err error) (*scanJob, error) {
+	fail := func(err error) (*payload, error) {
 		endTransfer(err)
 		releaseBytes(Outcome{Err: err})
 		return nil, err
@@ -374,8 +490,8 @@ func (p *Pipeline) fetchOne(ctx context.Context, j job) (*scanJob, error) {
 		return fail(err)
 	}
 
-	// The temp file is named by FileID, so two objects sharing a basename can no
-	// longer overwrite each other.
+	// Named by FileID, so two objects sharing a basename cannot overwrite each
+	// other.
 	localPath := filepath.Join(p.workDir, j.fileID)
 	f, err := os.Create(localPath)
 	if err != nil {
@@ -394,7 +510,7 @@ func (p *Pipeline) fetchOne(ctx context.Context, j job) (*scanJob, error) {
 
 	endTransfer(nil)
 
-	return &scanJob{
+	return &payload{
 		in: &scanner.ScanInput{
 			FileID:    j.fileID,
 			Bucket:    j.obj.Bucket,
@@ -408,50 +524,109 @@ func (p *Pipeline) fetchOne(ctx context.Context, j job) (*scanJob, error) {
 	}, nil
 }
 
-// runAnalyze runs the scanners, deletes the payload, and only then returns the
-// byte budget the fetch stage reserved for it.
-func (p *Pipeline) runAnalyze(ctx context.Context, in <-chan *scanJob, out chan<- *scanner.FileResult) {
-	for sj := range in {
-		// Whatever happens, the payload is deleted and the budget handed back.
-		// Missing either on any path leaks disk or wedges the pipeline: once the
-		// budget is held by reservations nobody returns, fetch never gets
-		// another token.
-		done := func() {
-			os.Remove(sj.in.LocalPath)
-			sj.release(Outcome{})
+// runDispatch fans one payload out to one task per enabled scanner.
+func (p *Pipeline) runDispatch(ctx context.Context, in <-chan *payload, findings chan<- *scanner.Finding) {
+	for pl := range in {
+		// Only the scanners that read the file hold a reference to it. IOC and
+		// the intel lookups need nothing but the hashes, so they must not keep
+		// a large temp file alive — nor delay the byte budget going back.
+		readers := int32(0)
+		for _, l := range p.lanes {
+			if l.scanner.NeedsPayload() {
+				readers++
+			}
 		}
-
-		select {
-		case <-ctx.Done():
-			done()
-			return
-		default:
+		if readers == 0 {
+			// Nothing will read the bytes, so free them now rather than at the
+			// end of scanning.
+			pl.free()
 		}
+		pl.refs.Store(readers)
 
-		started := time.Now()
-		releaseCPU, err := p.analyzeLimiter.Acquire(ctx, 1)
-		if err != nil {
-			done()
-			return
+		for _, l := range p.lanes {
+			t := &task{payload: pl, scanner: l.scanner}
+
+			if l.policy == policySpill {
+				select {
+				case l.in <- t:
+				default:
+					// Queue full and the wait is unbounded: park it durably and
+					// keep the pipeline moving.
+					p.spill(ctx, t, findings)
+				}
+				continue
+			}
+
+			select {
+			case l.in <- t:
+			case <-ctx.Done():
+				if l.scanner.NeedsPayload() {
+					pl.done()
+				}
+				return
+			}
 		}
-		result := p.engine.ProcessFile(ctx, sj.in)
-		releaseCPU(Outcome{Latency: time.Since(started)})
+	}
+}
 
-		// Every scanner that needed the bytes has run, so the payload can go —
-		// and only now may the budget be returned.
-		done()
-		p.m.ObserveStage(stageAnalyze, started, nil)
-		p.scanned.Add(1)
+// spill parks a task in the pending store for a later run.
+func (p *Pipeline) spill(ctx context.Context, t *task, findings chan<- *scanner.Finding) {
+	in := t.payload.in
+	if err := db.EnqueuePending(p.gdb, in.FileID, t.scanner.Name(), t.scanner.RulesVersion(), p.cfg.PendingRetryBase); err != nil {
+		log.Printf("spill %s/%s: %v", in.Key, t.scanner.Name(), err)
+	}
+	p.spilled.Add(1)
+	p.m.ObjectsSkipped.WithLabelValues("spilled_" + t.scanner.Name()).Inc()
 
-		for name, res := range result.Results {
-			p.m.Findings.WithLabelValues(name, string(res.Severity)).Inc()
-		}
+	// A spilled task that needs the bytes will re-download them on retry;
+	// holding disk for hours waiting on a quota is not an option.
+	if t.scanner.NeedsPayload() {
+		t.payload.done()
+	}
+}
 
-		select {
-		case out <- result:
-		case <-ctx.Done():
-			return
-		}
+// runLane processes one scanner's queue.
+func (p *Pipeline) runLane(ctx context.Context, l *lane, findings chan<- *scanner.Finding) {
+	for t := range l.in {
+		func() {
+			// The reference is given up however this task ends.
+			defer func() {
+				if l.scanner.NeedsPayload() {
+					t.payload.done()
+				}
+			}()
+
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			started := time.Now()
+			release, err := l.limiter.Acquire(ctx, 1)
+			if err != nil {
+				// Cancelled or rate-limited out: park it rather than drop it.
+				if l.policy == policySpill {
+					if e := db.EnqueuePending(p.gdb, t.payload.in.FileID, l.scanner.Name(),
+						l.scanner.RulesVersion(), p.cfg.PendingRetryBase); e != nil {
+						log.Printf("lane %s: %v", l.scanner.Name(), e)
+					}
+				}
+				return
+			}
+
+			finding := scanner.ScanOne(ctx, l.scanner, t.payload.in)
+			release(Outcome{Latency: time.Since(started)})
+
+			p.m.ObserveStage(stageAnalyze, started, nil)
+			p.m.Findings.WithLabelValues(finding.Scanner, string(finding.Severity)).Inc()
+			p.scanned.Add(1)
+
+			select {
+			case findings <- finding:
+			case <-ctx.Done():
+			}
+		}()
 	}
 }
 
@@ -463,9 +638,9 @@ func (p *Pipeline) runAnalyze(ctx context.Context, in <-chan *scanJob, out chan<
 // makes the latency bound a guarantee: no document waits longer than one
 // interval. A fixed ticker would publish a document arriving just before a tick
 // almost immediately and make one arriving just after wait a whole period.
-func (p *Pipeline) runPublish(ctx context.Context, in <-chan *scanner.FileResult) {
+func (p *Pipeline) runPublish(ctx context.Context, in <-chan *scanner.Finding) {
 	var (
-		batch      []*scanner.FileResult
+		batch      []*scanner.Finding
 		batchBytes int64
 		timer      *time.Timer
 		timeout    <-chan time.Time
@@ -505,7 +680,7 @@ func (p *Pipeline) runPublish(ctx context.Context, in <-chan *scanner.FileResult
 					p.flush(ctx, batch, "bytes")
 					batch, batchBytes = nil, 0
 				}
-				p.flush(ctx, []*scanner.FileResult{result}, "oversize")
+				p.flush(ctx, []*scanner.Finding{result}, "oversize")
 				continue
 			}
 
@@ -553,7 +728,7 @@ func (p *Pipeline) runPublish(ctx context.Context, in <-chan *scanner.FileResult
 // The ordering is load-bearing. Marking them first and publishing second would
 // mean a crash in between loses those findings permanently: the records say the
 // objects were scanned, so they are never queued again.
-func (p *Pipeline) flush(ctx context.Context, batch []*scanner.FileResult, trigger string) {
+func (p *Pipeline) flush(ctx context.Context, batch []*scanner.Finding, trigger string) {
 	started := time.Now()
 
 	err := p.send(ctx, batch)
@@ -567,21 +742,38 @@ func (p *Pipeline) flush(ctx context.Context, batch []*scanner.FileResult, trigg
 		return
 	}
 
-	for _, r := range batch {
-		rec := &db.FileRecord{
-			FileID: r.FileID, Bucket: r.Bucket, ObjectKey: r.Key,
-			Version: r.Version, Size: r.Size,
-			MD5: r.Hashes["md5"], SHA1: r.Hashes["sha1"], SHA256: r.Hashes["sha256"],
-			FetchedAt: r.ScanTime,
+	// One record per object, not per finding. Several findings share a FileID —
+	// one per scanner — and writing the same row repeatedly is wasted work.
+	//
+	// A record is written only once every finding for that object in this batch
+	// has been accepted by the sink. Marking it earlier would let a crash lose
+	// the remaining verdicts permanently: the record says the object was
+	// handled, so it is never queued again.
+	recorded := make(map[string]bool, len(batch))
+	for _, f := range batch {
+		if recorded[f.FileID] || f.Scanner == "size_gate" {
+			continue
 		}
-		if err := db.UpsertFileRecord(p.gdb, rec); err != nil {
-			log.Printf("publish: recording %s: %v", r.Key, err)
+		recorded[f.FileID] = true
+
+		if err := db.UpsertFileRecord(p.gdb, &db.FileRecord{
+			FileID: f.FileID, Bucket: f.Bucket, ObjectKey: f.Key,
+			Version: f.Version, Size: f.Size,
+			MD5: f.Hashes["md5"], SHA1: f.Hashes["sha1"], SHA256: f.Hashes["sha256"],
+			FetchedAt: f.ScannedAt,
+		}); err != nil {
+			log.Printf("publish: recording %s: %v", f.Key, err)
+			continue
+		}
+		// The scanner that produced this finding is done with this object.
+		if err := db.MarkDone(p.gdb, f.FileID, f.Scanner); err != nil {
+			log.Printf("publish: marking %s/%s done: %v", f.Key, f.Scanner, err)
 		}
 	}
 }
 
 // send prefers the sink's batch API and falls back to one call per document.
-func (p *Pipeline) send(ctx context.Context, batch []*scanner.FileResult) error {
+func (p *Pipeline) send(ctx context.Context, batch []*scanner.Finding) error {
 	if br, ok := p.rep.(reporter.BatchReporter); ok {
 		return br.ReportBatch(ctx, batch)
 	}
@@ -595,13 +787,12 @@ func (p *Pipeline) send(ctx context.Context, batch []*scanner.FileResult) error 
 
 // estimateSize approximates a document's serialised size, so the byte ceiling
 // can be enforced without marshalling twice.
-func estimateSize(r *scanner.FileResult) int64 {
+func estimateSize(f *scanner.Finding) int64 {
+	// A finding carries identity, hashes and one verdict, so its size is roughly
+	// constant regardless of how large the object was. What makes one big is the
+	// detail payload — a file tripping hundreds of YARA rules.
 	const envelope = 512
-	size := int64(envelope + len(r.Bucket) + len(r.Key))
-	for name, res := range r.Results {
-		size += int64(len(name) + 64 + len(res.Detail)*64)
-	}
-	return size
+	return int64(envelope + len(f.Bucket) + len(f.Key) + len(f.Scanner) + len(f.Detail)*96)
 }
 
 // sampleQueueDepth publishes channel occupancy until the returned function is
