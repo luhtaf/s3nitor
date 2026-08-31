@@ -1,51 +1,61 @@
-# Build stage
+# The SQLite driver is cgo, which shapes this whole file.
+#
+# A build without cgo links a go-sqlite3 stub that compiles cleanly and panics at
+# startup with "requires cgo to work. This is a stub" — so CGO_ENABLED=1 is not
+# optional, and neither is a C toolchain in the builder.
 FROM golang:1.25-alpine AS builder
 
-# Install build dependencies
-RUN apk add --no-cache git ca-certificates tzdata
+# gcc and musl-dev are what cgo needs. Without them the build fails with
+# 'C compiler "gcc" not found', which is how this Dockerfile shipped broken.
+RUN apk add --no-cache gcc musl-dev git ca-certificates tzdata
 
-# Set working directory
 WORKDIR /app
 
-# Copy go mod files
 COPY go.mod go.sum ./
-
-# Download dependencies
 RUN go mod download
 
-# Copy source code
 COPY . .
 
-# Build the application
-RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o s3scanner ./cmd/s3scanner
+ARG VERSION=dev
+# -trimpath and -s -w keep the binary small and reproducible. No -a: rebuilding
+# every dependency from scratch buys nothing and costs minutes.
+RUN CGO_ENABLED=1 GOOS=linux go build \
+      -trimpath \
+      -ldflags "-s -w -X main.Version=${VERSION}" \
+      -o /out/s3scanner ./cmd/s3scanner
 
-# Final stage
+# Prove the binary can open a database before it ships. A green build is not
+# evidence of a working binary here: the cgo failure mode only appears at
+# runtime, and this is the cheapest place to catch a regression.
+RUN /out/s3scanner --help >/dev/null 2>&1 || true
+RUN DB_DRIVER=sqlite3 DB_DSN=/tmp/probe.db \
+    S3_BUCKET=probe S3_ENDPOINT=http://127.0.0.1:1 \
+    S3_ACCESS_KEY=x S3_SECRET_KEY=x \
+    AWS_EC2_METADATA_DISABLED=true AWS_REGION=us-east-1 METRICS_ADDR= \
+    /out/s3scanner 2>&1 | tee /tmp/probe.log; \
+    if grep -q "CGO_ENABLED=0" /tmp/probe.log; then \
+      echo "FATAL: built without cgo, the sqlite driver is a stub"; exit 1; fi; \
+    if grep -q "failed init DB" /tmp/probe.log; then \
+      echo "FATAL: the binary cannot open its database"; exit 1; fi
+
+# ---------------------------------------------------------------------------
 FROM alpine:latest
 
-# Install runtime dependencies
-RUN apk --no-cache add ca-certificates tzdata
+# yara is a runtime dependency of the YARA scanner, which shells out to it. It
+# self-disables when the binary is missing, so leaving it out would silently
+# reduce coverage rather than fail — better to ship it.
+RUN apk --no-cache add ca-certificates tzdata yara && \
+    addgroup -g 1001 -S s3nitor && \
+    adduser -u 1001 -S s3nitor -G s3nitor
 
-# Create non-root user
-RUN addgroup -g 1001 -S s3scanner && \
-    adduser -u 1001 -S s3scanner -G s3scanner
-
-# Set working directory
 WORKDIR /app
-
-# Copy binary from builder stage
-COPY --from=builder /app/s3scanner .
-
-# Copy rules directory
+COPY --from=builder /out/s3scanner .
 COPY --from=builder /app/rules ./rules
 
-# Change ownership to non-root user
-RUN chown -R s3scanner:s3scanner /app
+RUN chown -R s3nitor:s3nitor /app
+USER s3nitor
 
-# Switch to non-root user
-USER s3scanner
-
-# Expose port (if needed for health checks)
+# Serves /metrics and /healthz.
 EXPOSE 8080
 
-# Set entrypoint
 ENTRYPOINT ["./s3scanner"]

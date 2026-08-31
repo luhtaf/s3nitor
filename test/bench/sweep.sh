@@ -23,9 +23,13 @@ MINIO_SECRET="${MINIO_SECRET:-s3nitor-test-minio-creds}"
 JOB=s3nitor-bench-run
 CSV="${CSV:-$REPO_ROOT/test/bench/results.csv}"
 
-[ -n "$IMAGE" ] || fail "set BENCH_IMAGE atau berikan image sebagai argumen kedua.
-  Bangun dan dorong dulu:
-    docker build -t <registry>/s3nitor:bench . && docker push <registry>/s3nitor:bench"
+IMAGE="${IMAGE:-ghcr.io/luhtaf/s3nitor:bench}"
+
+# The image has to be pullable by the cluster, which for a GHCR package means
+# either making it public or adding an imagePullSecret. A private package fails
+# with ImagePullBackOff and no useful message about why.
+kubectl get secret ghcr -n "$NS" >/dev/null 2>&1 \
+  || note "no 'ghcr' pull secret in $NS — this only works if the package is public"
 
 # --------------------------------------------------------------------------
 # The sweep. Each row is one run: a label, then the environment that defines it.

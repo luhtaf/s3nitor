@@ -20,6 +20,17 @@ make release             # host-platform release binary only (see cgo note below
 make docker-build        # docker build -t s3scanner .
 ```
 
+The image needs `gcc` and `musl-dev` in the builder stage — the alpine Go image
+does not ship a C compiler, and without them the cgo build fails with
+`C compiler "gcc" not found`. The Dockerfile also runs the binary against a real
+SQLite file before the final stage, so a cgo regression fails the build rather
+than shipping.
+
+Images publish to `ghcr.io/luhtaf/s3nitor` via `.github/workflows/image.yml`.
+The package is private until changed in the repository's package settings; a
+private package needs an `imagePullSecret` in the cluster or pulls fail with
+`ImagePullBackOff`.
+
 Run a single test once tests exist: `go test -v -run TestName ./internal/scanner/`.
 
 ### cgo is mandatory — do not cross-compile
