@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`s3nitor` (module `github.com/luhtaf/s3nitor`, binary `s3scanner`) scans S3-compatible object storage for malicious content. Go 1.25 (floor set by `pgx v5.10`, upgraded for its CVEs). No Go test files exist yet — the shell suites under `test/integration/` need a live cluster.
+`s3nitor` (module `github.com/luhtaf/s3nitor`, binary `s3scanner`) scans S3-compatible object storage for malicious content. Go 1.25 (floor set by `pgx v5.10`, upgraded for its CVEs). The shell suites under `test/integration/` and `test/bench/` need a live cluster; everything else runs with `go test`.
 
 Code comments and log messages are a mix of Indonesian and English — match the surrounding file rather than normalizing.
 
@@ -13,7 +13,7 @@ Code comments and log messages are a mix of Indonesian and English — match the
 ```bash
 make run                 # go run ./cmd/s3scanner/main.go
 make build               # -> build/s3scanner, LDFLAGS injects main.Version from git describe
-make test                # go test -v ./...   (no tests exist yet)
+make test                # go test -v ./...
 make fmt                 # go fmt ./...
 make lint                # golangci-lint run
 make release             # host-platform release binary only (see cgo note below)
@@ -31,7 +31,9 @@ The package is private until changed in the repository's package settings; a
 private package needs an `imagePullSecret` in the cluster or pulls fail with
 `ImagePullBackOff`.
 
-Run a single test once tests exist: `go test -v -run TestName ./internal/scanner/`.
+Run one test: `go test -race -run TestName ./internal/pipeline/`. Use `-race` for
+anything touching the pipeline — the limiters and the payload refcount are where
+concurrency bugs would hide, and several were caught that way.
 
 ### cgo is mandatory — do not cross-compile
 
