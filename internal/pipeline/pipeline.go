@@ -18,8 +18,8 @@ import (
 	"github.com/luhtaf/s3nitor/internal/hashing"
 	"github.com/luhtaf/s3nitor/internal/metrics"
 	"github.com/luhtaf/s3nitor/internal/reporter"
-	"github.com/luhtaf/s3nitor/internal/s3fetcher"
 	"github.com/luhtaf/s3nitor/internal/scanner"
+	"github.com/luhtaf/s3nitor/internal/source"
 )
 
 // Stage names, used as metric labels.
@@ -53,7 +53,7 @@ type Summary struct {
 
 // job carries an object from discovery to fetch.
 type job struct {
-	obj    s3fetcher.S3Object
+	ref    source.ObjectRef
 	fileID string
 }
 
@@ -78,6 +78,7 @@ type Pipeline struct {
 	gdb     *gorm.DB
 	m       *metrics.Metrics
 
+	listed  atomic.Int64
 	scanned atomic.Int64
 	skipped atomic.Int64
 	failed  atomic.Int64
@@ -138,7 +139,7 @@ func New(
 
 // Run pushes every object through the pipeline and returns once the last
 // finding has been published.
-func (p *Pipeline) Run(ctx context.Context, objects []s3fetcher.S3Object) (Summary, error) {
+func (p *Pipeline) Run(ctx context.Context, refs <-chan source.ObjectRef) (Summary, error) {
 	started := time.Now()
 
 	jobs := make(chan job, p.cfg.StageQueueSize)
@@ -189,7 +190,7 @@ func (p *Pipeline) Run(ctx context.Context, objects []s3fetcher.S3Object) (Summa
 		p.runPublish(ctx, findings)
 	}()
 
-	err := p.runDiscover(ctx, objects, jobs, findings)
+	err := p.runDiscover(ctx, refs, jobs, findings)
 
 	// Closed in order, waiting each time: a stage may only stop once nothing can
 	// still arrive for it.
@@ -205,7 +206,7 @@ func (p *Pipeline) Run(ctx context.Context, objects []s3fetcher.S3Object) (Summa
 	publishWG.Wait()
 
 	return Summary{
-		Listed:   len(objects),
+		Listed:   int(p.listed.Load()),
 		Scanned:  int(p.scanned.Load()),
 		Skipped:  int(p.skipped.Load()),
 		Failed:   int(p.failed.Load()),
@@ -216,61 +217,87 @@ func (p *Pipeline) Run(ctx context.Context, objects []s3fetcher.S3Object) (Summa
 
 // runDiscover filters objects and feeds the pipeline.
 //
-// Dedup is one batched query rather than one per object: discovery holds whole
-// pages, so a thousand objects cost one round trip instead of a thousand.
-func (p *Pipeline) runDiscover(ctx context.Context, objects []s3fetcher.S3Object, out chan<- job, notices chan<- *scanner.Finding) error {
+// Consumes a stream rather than a slice. The previous version pulled every
+// object's metadata into memory before a single worker started, so memory scaled
+// with the object count ahead of any work being done — and an event source never
+// ends, so there is no slice to take.
+//
+// Dedup is batched: references are accumulated up to dedupBatch and answered in
+// one query. One query per object turned a thousand objects into a thousand
+// round trips.
+func (p *Pipeline) runDiscover(ctx context.Context, refs <-chan source.ObjectRef, out chan<- job, notices chan<- *scanner.Finding) error {
+	const dedupBatch = 500
+
+	batch := make([]source.ObjectRef, 0, dedupBatch)
+
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		defer func() { batch = batch[:0] }()
+
+		ids := make([]string, len(batch))
+		for i, ref := range batch {
+			ids[i] = hashing.FileID(ref.Bucket, ref.Key, ref.Version)
+		}
+		seen, err := db.SeenFileIDs(p.gdb, ids)
+		if err != nil {
+			return err
+		}
+
+		for i, ref := range batch {
+			if seen[ids[i]] {
+				p.m.ObjectsSkipped.WithLabelValues("already_scanned").Inc()
+				p.skipped.Add(1)
+				continue
+			}
+			if p.cfg.MaxObjectSize > 0 && ref.Size > p.cfg.MaxObjectSize {
+				log.Printf("discover: skipping %s, %d bytes exceeds MAX_OBJECT_SIZE", ref.Key, ref.Size)
+				p.m.ObjectsSkipped.WithLabelValues("too_large").Inc()
+				p.skipped.Add(1)
+
+				// Not scanning something is itself worth reporting: the largest
+				// objects are exactly where something would be hidden, and a log
+				// line plus a counter disappears with the pod.
+				select {
+				case notices <- coverageGap(ref, ids[i], "exceeds_max_object_size", p.cfg.MaxObjectSize):
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				continue
+			}
+
+			select {
+			case out <- job{ref: ref, fileID: ids[i]}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	}
+
 	started := time.Now()
-
-	ids := make([]string, len(objects))
-	for i, obj := range objects {
-		ids[i] = hashing.FileID(obj.Bucket, obj.Key, obj.ETag)
-	}
-	seen, err := db.SeenFileIDs(p.gdb, ids)
-	if err != nil {
-		p.m.ObserveStage(stageDiscover, started, err)
-		return err
-	}
-
-	queued := 0
-	for i, obj := range objects {
+	for ref := range refs {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
 
-		if seen[ids[i]] {
-			p.m.ObjectsSkipped.WithLabelValues("already_scanned").Inc()
-			p.skipped.Add(1)
-			continue
-		}
-		if p.cfg.MaxObjectSize > 0 && obj.Size > p.cfg.MaxObjectSize {
-			log.Printf("discover: skipping %s, %d bytes exceeds MAX_OBJECT_SIZE", obj.Key, obj.Size)
-			p.m.ObjectsSkipped.WithLabelValues("too_large").Inc()
-			p.skipped.Add(1)
-
-			// Not scanning something is itself worth reporting. The largest
-			// objects in a bucket are exactly where something would be hidden,
-			// and a log line plus a counter disappears with the pod.
-			select {
-			case notices <- coverageGap(obj, ids[i], "exceeds_max_object_size", p.cfg.MaxObjectSize):
-			case <-ctx.Done():
-				return ctx.Err()
+		p.listed.Add(1)
+		batch = append(batch, ref)
+		if len(batch) >= dedupBatch {
+			if err := flush(); err != nil {
+				p.m.ObserveStage(stageDiscover, started, err)
+				return err
 			}
-			continue
-		}
-
-		select {
-		case out <- job{obj: obj, fileID: ids[i]}:
-			queued++
-		case <-ctx.Done():
-			return ctx.Err()
 		}
 	}
 
-	p.m.ObserveStage(stageDiscover, started, nil)
-	log.Printf("discover: %d queued, %d skipped", queued, len(objects)-queued)
-	return nil
+	err := flush()
+	p.m.ObserveStage(stageDiscover, started, err)
+	log.Printf("discover: %d seen, %d skipped", p.listed.Load(), p.skipped.Load())
+	return err
 }
 
 // coverageGap records that an object was deliberately not scanned.
@@ -282,20 +309,20 @@ func (p *Pipeline) runDiscover(ctx context.Context, objects []s3fetcher.S3Object
 // No FileRecord is written for these on purpose: leaving the object unrecorded
 // means raising MAX_OBJECT_SIZE later picks it up on the next run rather than
 // skipping it forever as already handled.
-func coverageGap(obj s3fetcher.S3Object, fileID, reason string, limit int64) *scanner.Finding {
+func coverageGap(ref source.ObjectRef, fileID, reason string, limit int64) *scanner.Finding {
 	return &scanner.Finding{
 		FileID:   fileID,
-		Bucket:   obj.Bucket,
-		Key:      obj.Key,
-		Version:  obj.ETag,
-		Size:     obj.Size,
+		Bucket:   ref.Bucket,
+		Key:      ref.Key,
+		Version:  ref.Version,
+		Size:     ref.Size,
 		Scanner:  "size_gate",
 		Match:    false,
 		Severity: scanner.SeverityLow,
 		Detail: map[string]any{
 			"scanned":     false,
 			"reason":      reason,
-			"object_size": obj.Size,
+			"object_size": ref.Size,
 			"limit":       limit,
 		},
 		ScannedAt: time.Now().UTC(),
@@ -433,7 +460,7 @@ func (p *Pipeline) runFetch(ctx context.Context, in <-chan job, out chan<- *payl
 		pl, err := p.fetchOne(ctx, j)
 		p.m.ObserveStage(stageFetch, started, err)
 		if err != nil {
-			log.Printf("fetch %s: %v", j.obj.Key, err)
+			log.Printf("fetch %s: %v", j.ref.Key, err)
 			p.failed.Add(1)
 			continue
 		}
@@ -454,7 +481,7 @@ func (p *Pipeline) runFetch(ctx context.Context, in <-chan job, out chan<- *payl
 func (p *Pipeline) fetchOne(ctx context.Context, j job) (*payload, error) {
 	// The object's size is the weight. This reservation outlives the function:
 	// it travels with the payload and is released once the file is gone.
-	releaseBytes, err := p.byteLimiter.Acquire(ctx, j.obj.Size)
+	releaseBytes, err := p.byteLimiter.Acquire(ctx, j.ref.Size)
 	if err != nil {
 		return nil, err
 	}
@@ -485,7 +512,7 @@ func (p *Pipeline) fetchOne(ctx context.Context, j job) (*payload, error) {
 		return nil, err
 	}
 
-	body, err = p.fetcher.Open(ctx, j.obj.Key)
+	body, err = p.fetcher.Open(ctx, j.ref.Key)
 	if err != nil {
 		return fail(err)
 	}
@@ -513,9 +540,9 @@ func (p *Pipeline) fetchOne(ctx context.Context, j job) (*payload, error) {
 	return &payload{
 		in: &scanner.ScanInput{
 			FileID:    j.fileID,
-			Bucket:    j.obj.Bucket,
-			Key:       j.obj.Key,
-			Version:   j.obj.ETag,
+			Bucket:    j.ref.Bucket,
+			Key:       j.ref.Key,
+			Version:   j.ref.Version,
 			Size:      h.Size(),
 			Hashes:    h.Sum(),
 			LocalPath: localPath,

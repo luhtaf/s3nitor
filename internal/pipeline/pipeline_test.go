@@ -19,8 +19,8 @@ import (
 	"github.com/luhtaf/s3nitor/internal/config"
 	"github.com/luhtaf/s3nitor/internal/db"
 	"github.com/luhtaf/s3nitor/internal/metrics"
-	"github.com/luhtaf/s3nitor/internal/s3fetcher"
 	"github.com/luhtaf/s3nitor/internal/scanner"
+	"github.com/luhtaf/s3nitor/internal/source"
 )
 
 // fakeOpener serves objects from memory and tracks how many bytes are being
@@ -161,6 +161,17 @@ func testDB(t *testing.T) *gorm.DB {
 	return gdb
 }
 
+// stream feeds a slice into the channel Run consumes, so the tests keep reading
+// as tables of objects rather than as channel plumbing.
+func stream(refs ...source.ObjectRef) <-chan source.ObjectRef {
+	ch := make(chan source.ObjectRef, len(refs))
+	for _, r := range refs {
+		ch <- r
+	}
+	close(ch)
+	return ch
+}
+
 func testConfig() *config.Config {
 	return &config.Config{
 		FetchByteBudget:      4096,
@@ -188,12 +199,12 @@ func TestByteBudgetBoundsBytesInFlight(t *testing.T) {
 	cfg.FetchByteBudget = budget
 
 	sizes := make(map[string]int64, objects)
-	objs := make([]s3fetcher.S3Object, 0, objects)
+	objs := make([]source.ObjectRef, 0, objects)
 	for i := 0; i < objects; i++ {
 		key := fmt.Sprintf("obj-%03d", i)
 		sizes[key] = objectSize
-		objs = append(objs, s3fetcher.S3Object{
-			Bucket: "b", Key: key, ETag: fmt.Sprintf("etag-%d", i), Size: objectSize,
+		objs = append(objs, source.ObjectRef{
+			Bucket: "b", Key: key, Version: fmt.Sprintf("etag-%d", i), Size: objectSize,
 		})
 	}
 
@@ -201,7 +212,7 @@ func TestByteBudgetBoundsBytesInFlight(t *testing.T) {
 	rep := &recordingReporter{}
 	p := New(cfg, opener, scanner.NewEngineWith(&fakeScanner{name: "test", needsFile: true}), rep, testDB(t), metrics.New(), t.TempDir())
 
-	if _, err := p.Run(context.Background(), objs); err != nil {
+	if _, err := p.Run(context.Background(), stream(objs...)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -229,9 +240,9 @@ func TestObjectLargerThanBudgetStillCompletes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if _, err := p.Run(ctx, []s3fetcher.S3Object{
-		{Bucket: "b", Key: "huge", ETag: "e", Size: 8192},
-	}); err != nil {
+	if _, err := p.Run(ctx, stream(
+		source.ObjectRef{Bucket: "b", Key: "huge", Version: "e", Size: 8192},
+	)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if rep.count() != 1 {
@@ -248,10 +259,10 @@ func TestMaxObjectSizeSkipsBeforeFetching(t *testing.T) {
 	rep := &recordingReporter{}
 	p := New(cfg, opener, scanner.NewEngineWith(&fakeScanner{name: "test", needsFile: true}), rep, testDB(t), metrics.New(), t.TempDir())
 
-	if _, err := p.Run(context.Background(), []s3fetcher.S3Object{
-		{Bucket: "b", Key: "small", ETag: "e1", Size: 100},
-		{Bucket: "b", Key: "big", ETag: "e2", Size: 5000},
-	}); err != nil {
+	if _, err := p.Run(context.Background(), stream(
+		source.ObjectRef{Bucket: "b", Key: "small", Version: "e1", Size: 100},
+		source.ObjectRef{Bucket: "b", Key: "big", Version: "e2", Size: 5000},
+	)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	// Two documents: the scan of the small object, and a coverage notice saying
@@ -293,15 +304,15 @@ func TestSecondRunSkipsAlreadyScannedObjects(t *testing.T) {
 	cfg := testConfig()
 	gdb := testDB(t)
 
-	objs := []s3fetcher.S3Object{
-		{Bucket: "b", Key: "a", ETag: "e1", Size: 64},
-		{Bucket: "b", Key: "c", ETag: "e2", Size: 64},
+	objs := []source.ObjectRef{
+		{Bucket: "b", Key: "a", Version: "e1", Size: 64},
+		{Bucket: "b", Key: "c", Version: "e2", Size: 64},
 	}
 	sizes := map[string]int64{"a": 64, "c": 64}
 
 	first := &recordingReporter{}
 	p1 := New(cfg, &fakeOpener{sizes: sizes}, scanner.NewEngineWith(&fakeScanner{name: "test", needsFile: true}), first, gdb, metrics.New(), t.TempDir())
-	if _, err := p1.Run(context.Background(), objs); err != nil {
+	if _, err := p1.Run(context.Background(), stream(objs...)); err != nil {
 		t.Fatalf("first run: %v", err)
 	}
 	if first.count() != 2 {
@@ -311,7 +322,7 @@ func TestSecondRunSkipsAlreadyScannedObjects(t *testing.T) {
 	second := &recordingReporter{}
 	opener2 := &fakeOpener{sizes: sizes}
 	p2 := New(cfg, opener2, scanner.NewEngineWith(&fakeScanner{name: "test", needsFile: true}), second, gdb, metrics.New(), t.TempDir())
-	if _, err := p2.Run(context.Background(), objs); err != nil {
+	if _, err := p2.Run(context.Background(), stream(objs...)); err != nil {
 		t.Fatalf("second run: %v", err)
 	}
 	if second.count() != 0 {
@@ -324,9 +335,9 @@ func TestSecondRunSkipsAlreadyScannedObjects(t *testing.T) {
 	// A changed ETag is a different version, so it must be scanned again.
 	third := &recordingReporter{}
 	p3 := New(cfg, &fakeOpener{sizes: sizes}, scanner.NewEngineWith(&fakeScanner{name: "test", needsFile: true}), third, gdb, metrics.New(), t.TempDir())
-	if _, err := p3.Run(context.Background(), []s3fetcher.S3Object{
-		{Bucket: "b", Key: "a", ETag: "CHANGED", Size: 64},
-	}); err != nil {
+	if _, err := p3.Run(context.Background(), stream(
+		source.ObjectRef{Bucket: "b", Key: "a", Version: "CHANGED", Size: 64},
+	)); err != nil {
 		t.Fatalf("third run: %v", err)
 	}
 	if third.count() != 1 {
@@ -342,17 +353,17 @@ func TestPartialBatchIsFlushedOnShutdown(t *testing.T) {
 	cfg.PublishFlushInterval = 10 * time.Hour // never fires
 
 	sizes := map[string]int64{}
-	var objs []s3fetcher.S3Object
+	var objs []source.ObjectRef
 	for i := 0; i < 3; i++ {
 		key := fmt.Sprintf("k%d", i)
 		sizes[key] = 32
-		objs = append(objs, s3fetcher.S3Object{Bucket: "b", Key: key, ETag: key, Size: 32})
+		objs = append(objs, source.ObjectRef{Bucket: "b", Key: key, Version: key, Size: 32})
 	}
 
 	rep := &recordingReporter{}
 	p := New(cfg, &fakeOpener{sizes: sizes}, scanner.NewEngineWith(&fakeScanner{name: "test", needsFile: true}), rep, testDB(t), metrics.New(), t.TempDir())
 
-	if _, err := p.Run(context.Background(), objs); err != nil {
+	if _, err := p.Run(context.Background(), stream(objs...)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if rep.count() != 3 {
@@ -381,12 +392,12 @@ func TestBudgetCoversDiskResidencyNotJustTransfer(t *testing.T) {
 	cfg.StageQueueSize = 100 // a count-based bound would permit 100 files here
 
 	sizes := make(map[string]int64, objects)
-	objs := make([]s3fetcher.S3Object, 0, objects)
+	objs := make([]source.ObjectRef, 0, objects)
 	for i := 0; i < objects; i++ {
 		key := fmt.Sprintf("obj-%02d", i)
 		sizes[key] = objectSize
-		objs = append(objs, s3fetcher.S3Object{
-			Bucket: "b", Key: key, ETag: key, Size: objectSize,
+		objs = append(objs, source.ObjectRef{
+			Bucket: "b", Key: key, Version: key, Size: objectSize,
 		})
 	}
 
@@ -417,7 +428,7 @@ func TestBudgetCoversDiskResidencyNotJustTransfer(t *testing.T) {
 		}
 	}()
 
-	if _, err := p.Run(context.Background(), objs); err != nil {
+	if _, err := p.Run(context.Background(), stream(objs...)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	close(stop)
@@ -448,11 +459,11 @@ func TestEachScannerPublishesItsOwnFinding(t *testing.T) {
 
 	const objects = 6
 	sizes := map[string]int64{}
-	var objs []s3fetcher.S3Object
+	var objs []source.ObjectRef
 	for i := 0; i < objects; i++ {
 		key := fmt.Sprintf("k%02d", i)
 		sizes[key] = 128
-		objs = append(objs, s3fetcher.S3Object{Bucket: "b", Key: key, ETag: key, Size: 128})
+		objs = append(objs, source.ObjectRef{Bucket: "b", Key: key, Version: key, Size: 128})
 	}
 
 	workDir := t.TempDir()
@@ -460,7 +471,7 @@ func TestEachScannerPublishesItsOwnFinding(t *testing.T) {
 	p := New(cfg, &fakeOpener{sizes: sizes},
 		scanner.NewEngineWith(fast, slow, other), rep, testDB(t), metrics.New(), workDir)
 
-	if _, err := p.Run(context.Background(), objs); err != nil {
+	if _, err := p.Run(context.Background(), stream(objs...)); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -506,11 +517,11 @@ func TestSpillLaneDoesNotBlockLocalScanners(t *testing.T) {
 
 	const objects = 20
 	sizes := map[string]int64{}
-	var objs []s3fetcher.S3Object
+	var objs []source.ObjectRef
 	for i := 0; i < objects; i++ {
 		key := fmt.Sprintf("q%02d", i)
 		sizes[key] = 64
-		objs = append(objs, s3fetcher.S3Object{Bucket: "b", Key: key, ETag: key, Size: 64})
+		objs = append(objs, source.ObjectRef{Bucket: "b", Key: key, Version: key, Size: 64})
 	}
 
 	gdb := testDB(t)
@@ -521,7 +532,7 @@ func TestSpillLaneDoesNotBlockLocalScanners(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	summary, err := p.Run(ctx, objs)
+	summary, err := p.Run(ctx, stream(objs...))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}

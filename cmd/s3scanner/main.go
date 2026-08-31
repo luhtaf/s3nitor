@@ -17,6 +17,9 @@ import (
 	"github.com/luhtaf/s3nitor/internal/reporter"
 	"github.com/luhtaf/s3nitor/internal/s3fetcher"
 	"github.com/luhtaf/s3nitor/internal/scanner"
+	"github.com/luhtaf/s3nitor/internal/source"
+	"github.com/luhtaf/s3nitor/internal/source/decoder"
+	"github.com/luhtaf/s3nitor/internal/source/transport"
 	"github.com/luhtaf/s3nitor/internal/sysinfo"
 )
 
@@ -78,11 +81,16 @@ func run() error {
 	}
 	defer os.RemoveAll(workDir)
 
-	objects, err := fetcher.ListObjects(ctx)
+	src, err := buildSource(cfg, fetcher)
 	if err != nil {
 		return err
 	}
-	log.Printf("listed %d objects", len(objects))
+	defer src.Close()
+
+	refs, err := src.Items(ctx)
+	if err != nil {
+		return err
+	}
 
 	// The threat-intel scanners are composed here rather than inside NewEngine:
 	// they need the cache, and wiring them in the scanner package would create
@@ -91,13 +99,68 @@ func run() error {
 	scanners = append(scanners, intel.NewOTX(cfg, gdb), intel.NewVirusTotal(cfg, gdb))
 
 	p := pipeline.New(cfg, fetcher, scanner.NewEngineWith(scanners...), rep, gdb, m, workDir)
-	summary, err := p.Run(ctx, objects)
+	summary, err := p.Run(ctx, refs)
 	if err != nil {
 		return err
 	}
 
 	logSummary(summary)
 	return nil
+}
+
+// buildSource picks where work comes from.
+//
+// One mode or the other, chosen by configuration rather than run together. A
+// hybrid — events plus a periodic reconciling sweep — is the better answer for
+// production, since event delivery does go missing when a broker is down or a
+// notification rule is added after the bucket already had objects in it. It is
+// deliberately not built yet: it needs a schedule and a way to tell a
+// reconciling pass from a live one, and neither belongs in the first version.
+func buildSource(cfg *config.Config, fetcher *s3fetcher.S3Fetcher) (source.Source, error) {
+	switch cfg.SourceMode {
+	case "", "lister":
+		log.Println("source: lister")
+		return source.NewLister(fetcher), nil
+
+	case "event":
+		dec, err := buildDecoder(cfg)
+		if err != nil {
+			return nil, err
+		}
+		switch cfg.EventTransport {
+		case "redis":
+			log.Printf("source: event, redis list %q on %s", cfg.RedisKey, cfg.RedisAddr)
+			return source.NewEvent(
+				transport.NewRedis(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisKey, cfg.RedisDB),
+				dec), nil
+		case "kafka":
+			log.Printf("source: event, kafka topic %q group %q", cfg.KafkaTopic, cfg.KafkaGroupID)
+			return source.NewEvent(
+				transport.NewKafka(cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaGroupID),
+				dec), nil
+		default:
+			return nil, fmt.Errorf("EVENT_TRANSPORT=%q is not supported; use redis or kafka", cfg.EventTransport)
+		}
+
+	default:
+		return nil, fmt.Errorf("SOURCE_MODE=%q is not supported; use lister or event", cfg.SourceMode)
+	}
+}
+
+// buildDecoder selects how payloads are read.
+//
+// Only MinIO is implemented, and it is selected explicitly rather than sniffed.
+// Automatic detection is workable for the JSON formats, whose markers are
+// distinctive, but not for SeaweedFS: protobuf is not self-describing, so random
+// bytes frequently parse as a "valid" message with unknown fields. Guessing
+// there produces silent misdecoding, which is worse than refusing.
+func buildDecoder(cfg *config.Config) (source.Decoder, error) {
+	switch cfg.EventFormat {
+	case "", "minio":
+		return decoder.MinIO{}, nil
+	default:
+		return nil, fmt.Errorf("EVENT_FORMAT=%q is not implemented yet; only minio is", cfg.EventFormat)
+	}
 }
 
 // logSummary prints one machine-readable line describing the run.

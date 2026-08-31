@@ -95,6 +95,25 @@ type Config struct {
 	// so it is visible rather than silently absent.
 	PendingMaxAttempts int
 
+	// --- where work comes from ---
+
+	// SourceMode is "lister" or "event". One or the other: a hybrid needs a
+	// schedule and a way to distinguish a reconciling pass from a live one.
+	SourceMode string
+	// EventTransport is "redis" or "kafka"; EventFormat names the payload
+	// dialect. The two vary independently — MinIO publishes to either broker.
+	EventTransport string
+	EventFormat    string
+
+	RedisAddr     string
+	RedisPassword string
+	RedisKey      string
+	RedisDB       int
+
+	KafkaBrokers []string
+	KafkaTopic   string
+	KafkaGroupID string
+
 	// --- threat intel ---
 
 	EnableVT bool
@@ -164,6 +183,17 @@ func Load() *Config {
 		},
 		PendingRetryBase:   getDuration("PENDING_RETRY_BASE", 30*time.Second),
 		PendingMaxAttempts: getInt("PENDING_MAX_ATTEMPTS", 5),
+
+		SourceMode:     getOrDefault("SOURCE_MODE", "lister"),
+		EventTransport: getOrDefault("EVENT_TRANSPORT", "redis"),
+		EventFormat:    getOrDefault("EVENT_FORMAT", "minio"),
+		RedisAddr:      getOrDefault("REDIS_ADDR", "localhost:6379"),
+		RedisPassword:  os.Getenv("REDIS_PASSWORD"),
+		RedisKey:       getOrDefault("REDIS_KEY", "s3nitor-events"),
+		RedisDB:        getInt("REDIS_DB", 0),
+		KafkaBrokers:   getList("KAFKA_BROKERS", []string{"localhost:9092"}),
+		KafkaTopic:     getOrDefault("KAFKA_TOPIC", "s3nitor-events"),
+		KafkaGroupID:   getOrDefault("KAFKA_GROUP_ID", "s3nitor"),
 
 		EnableVT:         os.Getenv("ENABLE_VT") == "true",
 		VTAPIKey:         os.Getenv("VT_API_KEY"),
