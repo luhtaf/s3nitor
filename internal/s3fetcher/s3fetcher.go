@@ -28,10 +28,10 @@ type S3Fetcher struct {
 }
 
 func NewS3Fetcher(cfg *config.Config) (*S3Fetcher, error) {
-	// default pakai LoadDefaultConfig
 	loadOpts := []func(*awsconfig.LoadOptions) error{}
 
-	// kalau ada key/secret di config → pakai static provider
+	// Static credentials when supplied; otherwise fall back to the usual AWS
+	// chain, which is what an IRSA or instance-role deployment wants.
 	if cfg.S3AccessKey != "" && cfg.S3SecretKey != "" {
 		loadOpts = append(loadOpts,
 			awsconfig.WithCredentialsProvider(
@@ -40,27 +40,37 @@ func NewS3Fetcher(cfg *config.Config) (*S3Fetcher, error) {
 		)
 	}
 
-	// kalau ada endpoint MinIO → override resolver
-	if cfg.S3Endpoint != "" {
-		loadOpts = append(loadOpts,
-			awsconfig.WithEndpointResolverWithOptions(
-				aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-					return aws.Endpoint{
-						URL:           cfg.S3Endpoint,
-						SigningRegion: "us-east-1", // default, MinIO bebas region
-					}, nil
-				}),
-			),
-		)
+	region := cfg.S3Region
+	if region == "" {
+		// MinIO and most S3-compatible servers ignore the region, but the
+		// signer requires one.
+		region = "us-east-1"
 	}
+	loadOpts = append(loadOpts, awsconfig.WithRegion(region))
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(context.TODO(), loadOpts...)
 	if err != nil {
 		return nil, err
 	}
 
+	s3Opts := []func(*s3.Options){}
+	if cfg.S3Endpoint != "" {
+		// BaseEndpoint rather than the deprecated endpoint resolver, which the
+		// SDK now warns about and which silently loses path-style handling.
+		s3Opts = append(s3Opts, func(o *s3.Options) {
+			o.BaseEndpoint = aws.String(cfg.S3Endpoint)
+
+			// Path style is not optional against a custom endpoint. The default
+			// is virtual-hosted style, which puts the bucket in the hostname:
+			// against http://127.0.0.1:9000 the SDK tries
+			// http://bucket.127.0.0.1:9000 and DNS resolution fails outright.
+			// MinIO, Ceph and SeaweedFS all expect the bucket in the path.
+			o.UsePathStyle = true
+		})
+	}
+
 	return &S3Fetcher{
-		client: s3.NewFromConfig(awsCfg),
+		client: s3.NewFromConfig(awsCfg, s3Opts...),
 		bucket: cfg.S3Bucket,
 		prefix: cfg.S3Prefix,
 	}, nil

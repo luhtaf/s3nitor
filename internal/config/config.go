@@ -33,6 +33,7 @@ type Config struct {
 	S3AccessKey   string
 	S3SecretKey   string
 	S3Endpoint    string
+	S3Region      string
 	WorkerCount   int    `envconfig:"WORKER_COUNT" default:"0"`
 	ReporterType  string // "json" | "elasticsearch" | "loki" | "prometheus"
 	ReporterPath  string // kalau json ke file
@@ -156,6 +157,7 @@ func Load() *Config {
 		S3AccessKey:   os.Getenv("S3_ACCESS_KEY"),
 		S3SecretKey:   os.Getenv("S3_SECRET_KEY"),
 		S3Endpoint:    os.Getenv("S3_ENDPOINT"),
+		S3Region:      os.Getenv("S3_REGION"),
 		WorkerCount:   workerCount,
 		ReporterType:  os.Getenv("REPORTER_TYPE"),
 		ReporterPath:  os.Getenv("REPORTER_PATH"),
