@@ -225,8 +225,21 @@ func (p *Pipeline) Run(ctx context.Context, refs <-chan source.ObjectRef) (Summa
 // Dedup is batched: references are accumulated up to dedupBatch and answered in
 // one query. One query per object turned a thousand objects into a thousand
 // round trips.
+//
+// The batch is also flushed on a timer, and that is not an optimisation — it is
+// what makes event mode work at all. Size alone is a sufficient trigger only
+// when the stream ends, because the final flush happens on close. An event
+// source never closes, so a bucket receiving a handful of uploads leaves them
+// sitting in a partial batch indefinitely: acknowledged to the broker, counted
+// as listed, and never scanned. Nothing errors, so nothing is logged. This is
+// the same guarantee the publish stage already makes, for the same reason.
 func (p *Pipeline) runDiscover(ctx context.Context, refs <-chan source.ObjectRef, out chan<- job, notices chan<- *scanner.Finding) error {
-	const dedupBatch = 500
+	const (
+		dedupBatch = 500
+		// Measured from the first reference entering an empty batch, so no
+		// object waits longer than this before being scanned.
+		dedupFlushInterval = 2 * time.Second
+	)
 
 	batch := make([]source.ObjectRef, 0, dedupBatch)
 
@@ -277,27 +290,65 @@ func (p *Pipeline) runDiscover(ctx context.Context, refs <-chan source.ObjectRef
 	}
 
 	started := time.Now()
-	for ref := range refs {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
 
-		p.listed.Add(1)
-		batch = append(batch, ref)
-		if len(batch) >= dedupBatch {
+	var (
+		timer   *time.Timer
+		timeout <-chan time.Time
+	)
+	stopTimer := func() {
+		if timer != nil {
+			timer.Stop()
+			timer, timeout = nil, nil
+		}
+	}
+	defer stopTimer()
+
+	for {
+		select {
+		case ref, ok := <-refs:
+			if !ok {
+				// The stream ended: a lister finished its walk, or the source
+				// was closed. Whatever is left is flushed here.
+				stopTimer()
+				err := flush()
+				p.m.ObserveStage(stageDiscover, started, err)
+				log.Printf("discover: %d seen, %d skipped", p.listed.Load(), p.skipped.Load())
+				return err
+			}
+
+			p.listed.Add(1)
+			batch = append(batch, ref)
+
+			// Started on the first reference into an empty batch rather than
+			// run as a fixed ticker: a ticker would publish whatever arrived
+			// just before a tick immediately and make the next arrival wait a
+			// full interval, so it bounds nothing.
+			if len(batch) == 1 {
+				timer = time.NewTimer(dedupFlushInterval)
+				timeout = timer.C
+			}
+
+			if len(batch) >= dedupBatch {
+				stopTimer()
+				if err := flush(); err != nil {
+					p.m.ObserveStage(stageDiscover, started, err)
+					return err
+				}
+			}
+
+		case <-timeout:
+			stopTimer()
 			if err := flush(); err != nil {
 				p.m.ObserveStage(stageDiscover, started, err)
 				return err
 			}
+
+		case <-ctx.Done():
+			stopTimer()
+			p.m.ObserveStage(stageDiscover, started, ctx.Err())
+			return ctx.Err()
 		}
 	}
-
-	err := flush()
-	p.m.ObserveStage(stageDiscover, started, err)
-	log.Printf("discover: %d seen, %d skipped", p.listed.Load(), p.skipped.Load())
-	return err
 }
 
 // coverageGap records that an object was deliberately not scanned.

@@ -590,3 +590,70 @@ func TestPendingTasksAreClaimable(t *testing.T) {
 		t.Errorf("a live lease was stolen: %d tasks claimed", len(again))
 	}
 }
+
+// An event source never closes its channel, and discovery has to cope with that
+// on its own.
+//
+// Every other test here feeds the pipeline through stream(), which closes the
+// channel — so the flush that runs on close always rescued the partial dedup
+// batch, and a size-only trigger looked correct for the whole suite. In event
+// mode there is no close: a handful of uploads sat in the batch indefinitely,
+// acknowledged to the broker and counted as listed, while nothing was scanned
+// and nothing errored. This is that shape, with a batch that stays far below
+// dedupBatch and a context cancelled from the outside the way SIGTERM does it.
+func TestOpenEndedSourceStillScansPartialDedupBatch(t *testing.T) {
+	const objects = 3
+
+	cfg := testConfig()
+
+	sizes := map[string]int64{}
+	refs := make(chan source.ObjectRef, objects)
+	for i := 0; i < objects; i++ {
+		key := fmt.Sprintf("event%d", i)
+		sizes[key] = 32
+		refs <- source.ObjectRef{Bucket: "b", Key: key, Version: key, Size: 32}
+	}
+	// Deliberately not closed: this is the whole point of the test.
+
+	rep := &recordingReporter{}
+	sc := &fakeScanner{name: "test", needsFile: true}
+	p := New(cfg, &fakeOpener{sizes: sizes}, scanner.NewEngineWith(sc), rep, testDB(t), metrics.New(), t.TempDir())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Run returns context.Canceled here, which is the expected shutdown
+		// path for an endless source rather than a failure.
+		_, _ = p.Run(ctx, refs)
+	}()
+
+	// Long enough for the discover timer to fire and the work to land, short
+	// enough that a regression fails the test rather than hanging it.
+	deadline := time.After(5 * time.Second)
+	for rep.count() < objects {
+		select {
+		case <-deadline:
+			t.Fatalf("published %d of %d documents before the deadline — "+
+				"the dedup batch was never flushed without a channel close",
+				rep.count(), objects)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+
+	if got := int(sc.calls.Load()); got != objects {
+		t.Errorf("scanner ran %d times, want %d", got, objects)
+	}
+	if got := sc.missingFile.Load(); got != 0 {
+		t.Errorf("payload was missing for %d scans", got)
+	}
+}

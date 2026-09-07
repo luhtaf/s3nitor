@@ -151,7 +151,13 @@ DSN; without them a second writer fails instead of waiting.
 ### Sources (`internal/source`)
 
 `SOURCE_MODE=lister|event`. The pipeline consumes a **stream**, so an event source
-that never ends works the same as a finite listing.
+that never ends works the same as a finite listing — but only because every
+batching stage flushes on a timer as well as on size. Discovery batches its dedup
+lookups, and a size-only trigger left a partial batch sitting forever under an
+endless source: acknowledged to the broker, counted as listed, never scanned, and
+silent because nothing failed. Any new batching added here needs the same pair of
+triggers, and a test that does **not** close the channel — `stream()` in the tests
+closes it, which is exactly why the whole suite missed this.
 
 Event mode is `Transport` (redis, kafka) plus `Decoder` (minio). These vary
 independently — but less than expected: the same MinIO instance wraps the identical
@@ -179,7 +185,7 @@ bucket in the hostname, which cannot resolve against a custom endpoint.
 ## Verifying changes
 
 ```bash
-go test -race ./...        # 39 tests, no infrastructure needed
+go test -race ./...        # 40 tests, no infrastructure needed
 ./test/e2e/local.sh        # real MinIO in Docker, no cluster
 ```
 
