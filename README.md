@@ -1,6 +1,6 @@
 # S3-GPT Scanner
 
-[![Go Version](https://img.shields.io/badge/Go-1.21+-blue.svg)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/Go-1.25+-blue.svg)](https://golang.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/luhtaf/s3nitor)](https://goreportcard.com/report/github.com/luhtaf/s3nitor)
 
@@ -11,23 +11,34 @@ A high-performance Go application designed for security professionals and DevOps
 ## 🚀 Features
 
 ### 🔍 Multi-Engine Scanning
-- **OTX Scanner**: AlienVault Open Threat Exchange integration for threat intelligence
 - **IOC Scanner**: Indicator of Compromise detection (MD5, SHA1, SHA256 hash matching)
-- **YARA Scanner**: Advanced pattern-based malware detection with custom rules
-- **Hash Scanner**: Efficient file hash computation and comparison
+- **YARA Scanner**: Pattern-based detection with your own rules
+- **OTX Scanner**: AlienVault Open Threat Exchange lookups
+- **VirusTotal Scanner**: Hash lookups only — file contents are never uploaded
+
+MD5, SHA1 and SHA256 are computed during the download rather than by a separate
+scanner, so each object is read once and the hash-consuming scanners have no
+ordering dependency between them.
 
 ### 📊 Flexible Reporting
 - **JSON Reporter**: Local file output with structured data
 - **Elasticsearch Reporter**: Real-time indexing for SIEM integration
 - **Loki Reporter**: Log aggregation and centralized logging
-- **Prometheus Reporter**: Metrics collection and monitoring
+
+Pipeline metrics are served for scraping on `METRICS_ADDR` (`/metrics`), not
+pushed — Prometheus is pull-based.
 
 ### 🏗️ Enterprise Architecture
 - **S3-Compatible Storage**: Support for AWS S3, MinIO, DigitalOcean Spaces, Backblaze B2
-- **Database Tracking**: SQLite-based file tracking to prevent re-scanning
-- **Worker Pool**: Configurable concurrent processing for optimal performance
-- **Graceful Shutdown**: Proper cleanup and signal handling
-- **Modular Design**: Easy to extend with custom scanners and reporters
+- **Database Tracking**: SQLite, MySQL or PostgreSQL, to avoid re-scanning
+- **Staged Pipeline**: Each stage is bounded by the resource it actually contends
+  for — bytes in flight for transfers, cores for scanning, request rate for
+  quota-limited APIs — rather than by one shared worker count
+- **Per-scanner Lanes**: A quota-limited lookup parks its work instead of holding
+  up the local scanners
+- **Event-driven or scheduled**: Consume bucket notifications, or paginate the
+  bucket for backfills
+- **Graceful Shutdown**: Partial batches are published rather than discarded
 
 ## 🗄️ Storage Support
 
@@ -132,7 +143,7 @@ as **protobuf** (`filer_pb.EventNotification`) rather than JSON. Consequences:
 
 ### Prerequisites
 
-- **Go 1.21+** - [Download](https://golang.org/dl/)
+- **Go 1.25+** - [Download](https://golang.org/dl/) (the floor comes from `pgx v5.10`)
 - **S3-Compatible Storage Access** - AWS S3, MinIO, DigitalOcean Spaces, etc.
 - **YARA** (Optional) - For malware detection
   ```bash
@@ -246,7 +257,9 @@ docker run \
 | `S3_SECRET_KEY` | Secret key | - | **Yes** |
 | `S3_ENDPOINT` | Endpoint URL | `https://s3.amazonaws.com` | No |
 | **Performance** |
-| `WORKER_COUNT` | Worker goroutines | `0` (auto-detect) | No |
+| `FETCH_BYTE_BUDGET` | Total bytes the pipeline may hold | `512MB` | No |
+| `FETCH_MAX_CONNS` | Concurrent transfers | `16` | No |
+| `ANALYZE_CPU_LIMIT` | Concurrent scanning; 0 = GOMAXPROCS | `0` | No |
 | **Reporting** |
 | `REPORTER_TYPE` | Output format | `json` | No |
 | `REPORTER_PATH` | Output file path | `./scan-results.json` | No |
@@ -313,9 +326,16 @@ export ES_INDEX=s3-scan-results
 go run cmd/s3scanner/main.go
 ```
 
-#### Custom Worker Count
+#### Tuning concurrency
+
+Each stage is bounded by the resource it actually contends for, so there is no
+single worker count. Bound transfers by bytes rather than file count — ten
+thousand small objects and one large one have very different memory costs:
+
 ```bash
-export WORKER_COUNT=8
+export FETCH_BYTE_BUDGET=256MB   # total bytes held, network buffers plus temp files
+export FETCH_MAX_CONNS=8         # concurrent transfers
+export ANALYZE_CPU_LIMIT=0       # 0 means GOMAXPROCS
 go run cmd/s3scanner/main.go
 ```
 
@@ -355,32 +375,52 @@ export S3_SECRET_KEY=your-b2-application-key
 
 ## 🏗️ Architecture
 
+Four stages connected by bounded channels. A stage boundary exists to separate
+different resource profiles: discovery waits on pagination, fetch on the network
+while holding bytes, local scanners on CPU, and threat-intel lookups on somebody
+else's quota. One shared worker count cannot be right for all four, so there
+isn't one.
+
 ```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   S3 Storage    │    │   S3 Fetcher    │    │  Worker Pool    │
-│                 │───▶│                 │───▶│                 │
-│ • List Objects  │    │ • Download      │    │ • Process Files │
-│ • Metadata      │    │ • Local Temp    │    │ • Concurrent    │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-                                                       │
-                                                       ▼
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Reporters     │◀───│  Scanner Engine │◀───│  Scan Context   │
-│                 │    │                 │    │                 │
-│ • JSON          │    │ • OTX Scanner   │    │ • File Info     │
-│ • Elasticsearch │    │ • IOC Scanner   │    │ • Results       │
-│ • Loki          │    │ • YARA Scanner  │    │ • Metadata      │
-│ • Prometheus    │    │ • Hash Scanner  │    └─────────────────┘
-└─────────────────┘    └─────────────────┘
+  discover  ──►  fetch + hash  ──►  dispatch  ──┬──►  ioc         ──┐  block
+  lister or      one pass over      one task    ├──►  yara        ──┤  block
+  events         the bytes         per scanner  ├──►  otx         ──┼─►  publish
+                                                └──►  virustotal  ──┘  spill
+  1 goroutine    byte budget        file × scanner   per-lane limiter   batch + flush
+  dedup batched  + conn slots                                          1 goroutine
 ```
 
-### Data Flow
+| Stage | Bounded by | Why that unit |
+|---|---|---|
+| discover | nothing — 1 goroutine | pagination is sequential |
+| fetch + hash | **bytes in flight** | ten thousand small objects and one large one cost very different memory; a file count cannot tell them apart |
+| analyze | CPU cores, shared | past `GOMAXPROCS`, more goroutines add context switching and no throughput |
+| publish | batch size, bytes, interval | the sink charges per request far more than per document |
 
-1. **S3 Fetcher**: Lists objects and downloads files to temporary storage
-2. **Worker Pool**: Processes files concurrently using configurable workers
-3. **Scanner Engine**: Applies multiple scanning engines to each file
-4. **Reporter**: Sends results to configured output destinations
-5. **Database**: Tracks processed files to avoid re-scanning
+The byte budget is the global brake. It is held from the start of a transfer
+until the payload is deleted after scanning — the bytes are resident that whole
+time, first in network buffers and then on disk — so when everything downstream
+stalls, fetch runs out of budget and stops pulling.
+
+### Block versus spill
+
+When a lane's queue fills, what happens depends on **how long the wait is**. CPU
+saturation clears in seconds, so those lanes push back on the stage upstream. An
+API quota clears in hours, so those lanes park the task in the database and move
+on: a four-per-minute VirusTotal key sharing a queue with the local scanners
+would otherwise cap the entire pipeline at four files per minute.
+
+### Data flow
+
+1. **Discover** lists the bucket, or consumes bucket notifications, and answers
+   dedup in one batched query rather than one per object
+2. **Fetch** streams each object to disk while hashing it in the same pass
+3. **Dispatch** fans one object out to one task per enabled scanner; the payload
+   is reference-counted by the scanners that actually read it
+4. **Lanes** run each scanner under its own limiter and publish each verdict on
+   its own — a slow lookup never delays a fast rule match
+5. **Publish** batches findings, and records an object as scanned only *after*
+   the sink has accepted them
 
 ## 📁 Project Structure
 

@@ -55,42 +55,136 @@ Configuration is entirely environment variables loaded via `godotenv` from `.env
 
 ## Architecture
 
-Single-shot batch pipeline, not a daemon. `cmd/s3scanner/main.go` owns the entire orchestration — there is no separate service layer:
+Single-shot batch job, not a daemon. `cmd/s3scanner/main.go` is wiring only; the
+work lives in `internal/pipeline`.
 
-1. `config.Load()` reads every setting from env into one flat `*Config` struct that is passed to every constructor.
-2. `s3fetcher.ListObjects` paginates the whole bucket into a slice up front (all metadata held in memory).
-3. A buffered `jobs` channel sized to `len(objects)` feeds `WORKER_COUNT` goroutines (defaults to `runtime.NumCPU()`).
-4. Each worker: DB dedup check → `fetcher.Download` to `os.TempDir()` → `engine.ProcessFile` → `rep.Report` → `db.UpsertFileRecord` → `os.Remove(localPath)`.
-5. Signal trap cancels the shared `context.Context`; workers check `ctx.Done()` between jobs.
+```
+discover ──► fetch+hash ──► dispatch ──┬─► ioc  ────────┐
+1 goroutine   byte budget   file×scanner├─► yara ───────┼─► publish
+dedup batched + conn slots              └─► virustotal ─┘   batch+flush
+                                                            1 goroutine
+```
 
-### Scanner engine (`internal/scanner`)
+**A stage boundary exists to separate different resource profiles.** Discovery
+waits on pagination, fetch on the network while holding bytes, local scanners on
+CPU, intel scanners on somebody else's quota. One bound across all of them would
+have to be chosen for the worst case.
 
-All scanners implement `Scanner` (`Name() / Enabled() / Scan(ctx, *ScanContext) error`) and mutate a shared `*ScanContext` in sequence. **Ordering is load-bearing**: `NewEngine` always registers `HashScanner` first because it populates `sc.Hashes`, which `IOCScanner` and `OTXScanner` read as their only input. A new hash-consuming scanner must be appended after it.
+### Limiters (`internal/pipeline/limiter.go`)
 
-Scan errors are logged and swallowed inside `ProcessFile` — one failing scanner never aborts the others, and `ProcessFile` never returns a non-nil error today.
+All satisfy `Limiter`: `Acquire(ctx, weight) (release func(Outcome), error)`.
 
-`Engine.Run` is vestigial (just blocks on ctx); `main.go` calls `ProcessFile` directly.
+- **`byteLimiter`** is the global brake and the one to be careful with. It is
+  acquired in fetch and released only after the analyze stage deletes the temp
+  file, because the bytes are resident that whole time — first in network
+  buffers, then on disk. Releasing it when the transfer ends (an earlier bug)
+  removed the backpressure entirely: fetch stopped backing off and filled the
+  disk while the accounting claimed the budget was free.
+- **`connLimiter`** bounds concurrent transfers, a shorter span.
+- **`cpuLimiter`** is shared by every local lane. One per lane would permit a
+  multiple of the intended parallelism.
+- Spill lanes get their own `RateLimiter`, because "four requests per minute"
+  cannot be expressed as a concurrency limit.
 
-Scanner specifics:
-- `YARAScanner` shells out to the `yara` binary (`YARA_CMD`) once per `.yar` file, parsing stdout. It self-disables in its constructor if the binary is missing or the rules dir has no `.yar` files — exit code 1 means "no match", not an error.
-- `OTXScanner` is gated on `cfg.EnableOTX && cfg.S3Endpoint != ""` plus a non-empty API key.
+An object larger than the whole budget is **clamped**, not rejected —
+`semaphore.Weighted` blocks forever on an unsatisfiable request.
 
-### Reporters (`internal/reporter`)
+### Scanners (`internal/scanner`, `internal/intel`)
 
-`Build(cfg)` switches on `REPORTER_TYPE` (`json` | `elasticsearch` | `loki` | `prometheus`; empty falls back to JSON). One `Reporter` instance is shared across all workers, so any new reporter must be goroutine-safe — the existing JSON reporter is not (concurrent appends to the same file).
+```go
+Scan(ctx context.Context, in *ScanInput) (Result, error)
+```
 
-Each reporter independently builds the same `bucket/key/size/hashes/scan_time/results` envelope; changing the output shape means editing all of them.
+`ScanInput` is read-only and shared; each scanner returns its own `Result`. There
+is no shared mutable state, so registration order carries no meaning and lanes
+run concurrently. Hashing is not a scanner — it is an `io.Writer` teed into the
+download (`internal/hashing`), so hashes arrive as input.
+
+`NeedsPayload()` decides two things: whether the payload refcount holds the temp
+file open for this scanner, and whether a retried task must re-download. Only
+YARA needs the bytes; IOC and the intel lookups need only hashes.
+
+`NewEngine` builds the local scanners. The intel ones are composed in `main.go`
+instead — they need the cache, and wiring them inside `scanner` would make
+`scanner` import `intel` while `intel` imports `scanner`.
+
+### Block versus spill
+
+A full queue is handled by **how long the wait is**, not how slow the scanner is.
+CPU saturation clears in seconds, so those lanes block upstream. An API quota
+clears in hours, so those lanes write the task to `scan_tasks` and move on —
+otherwise a four-per-minute VirusTotal key would cap the whole pipeline at four
+files per minute. `SPILL_SCANNERS` names which.
+
+### Publishing
+
+One document per **(file × scanner)**, not per file. Correlation happens at query
+time on `file_id`, so a slow scanner never delays a fast one's result.
+
+Flush triggers, whichever fires first: batch size, byte ceiling, or an interval
+measured from the first document entering an empty batch (so no document waits
+longer than one interval). A partial batch is drained on shutdown. A document
+that alone exceeds the byte ceiling is sent on its own.
+
+**Ordering is load-bearing:** records are written only *after* the sink accepts
+the batch. Reversed, a crash in between loses those findings permanently — the
+record claims the object was handled, so it is never queued again. That is safe
+only because `Finding.DocID()` is deterministic, which turns a replay into an
+overwrite.
 
 ### Persistence (`internal/db`)
 
-GORM with sqlite3/mysql/postgres selected by `DB_DRIVER`. `FileRecord` is keyed by `(bucket, object_key)` for re-scan avoidance.
+- **`FileRecord`** keyed by `FileID = sha256(bucket ‖ key ‖ version)`. Folding the
+  version into the key means a row's existence already proves this exact content
+  was scanned — there is no second timestamp comparison to disagree with it.
+  `version` is the ETag where the storage has one; SeaweedFS has none.
+- **`ScanTask`** is one row per (file × scanner): pending queue, retry ledger and
+  dedup key at once. It holds no results. Leases rather than a running flag, so a
+  dead process does not strand rows and a healthy replica is not robbed.
+- **`IntelCache`** is keyed by **content hash**, not FileID: a threat-intel lookup
+  is a pure function of the bytes, so the same payload under twenty keys costs one
+  request. A 404 is cached too — it is an answer.
 
-Note the skip logic in `main.go` compares `record.ETag == j.ETag && !record.UpdatedAt.Before(j.LastModified)`, while `UpsertFileRecord` compares `existing.UpdatedAt.Equal(record.UpdatedAt)` against a `record.UpdatedAt` the caller never sets (it sets `ScanTime`). These two paths disagree; be deliberate when touching either.
+SQLite needs `_journal_mode=WAL` and a busy timeout, which `NewDB` adds to the
+DSN; without them a second writer fails instead of waiting.
+
+### Sources (`internal/source`)
+
+`SOURCE_MODE=lister|event`. The pipeline consumes a **stream**, so an event source
+that never ends works the same as a finite listing.
+
+Event mode is `Transport` (redis, kafka) plus `Decoder` (minio). These vary
+independently — but less than expected: the same MinIO instance wraps the identical
+event as `{"Records":[…]}` for Kafka and `[{"Event":[…]}]` for Redis, so the
+decoder sniffs the envelope rather than the vendor.
+
+Two measured quirks the decoder tests pin down: keys need `url.QueryUnescape`, not
+`PathUnescape` (a space arrives as `+`, and `PathUnescape` leaves it, returning a
+key that does not exist without an error); and streamed uploads arrive as
+`s3:ObjectCreated:CompleteMultipartUpload`, not `:Put`.
+
+`S3_ENDPOINT` forces `UsePathStyle` — the default virtual-hosted style puts the
+bucket in the hostname, which cannot resolve against a custom endpoint.
 
 ## Extension points
 
-- **New scanner**: implement `Scanner` in `internal/scanner/`, add the config field in `internal/config/config.go`, register in `NewEngine` (after `HashScanner` if it needs hashes), write results into `sc.Results[Name()]`.
-- **New reporter**: implement `Reporter` in `internal/reporter/`, add config fields, add a case to `Build`.
+- **New scanner**: implement `Scanner`, add config, register in `NewEngine` (or
+  compose in `main.go` if it needs the DB). Add its name to `SPILL_SCANNERS` if it
+  waits on something external.
+- **New reporter**: implement `Reporter`; optionally `BatchReporter` if the sink
+  has a bulk API. Add a case to `Build`.
+- **New event format**: implement `Decoder`, add a case to `buildDecoder`. Test it
+  against a captured payload in `test/fixtures/`, not against a hand-written one.
+
+## Verifying changes
+
+```bash
+go test -race ./...        # 39 tests, no infrastructure needed
+./test/e2e/local.sh        # real MinIO in Docker, no cluster
+```
+
+`test/e2e/local.sh` is the one that catches integration bugs: every Go test uses a
+fake fetcher, so nothing else proves real bytes survive the pipeline.
 
 ## Rules directories
 

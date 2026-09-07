@@ -34,7 +34,6 @@ type Config struct {
 	S3SecretKey   string
 	S3Endpoint    string
 	S3Region      string
-	WorkerCount   int    `envconfig:"WORKER_COUNT" default:"0"`
 	ReporterType  string // "json" | "elasticsearch" | "loki" | "prometheus"
 	ReporterPath  string // kalau json ke file
 	ESUrl         string // url elasticsearch
@@ -140,8 +139,6 @@ type Config struct {
 func Load() *Config {
 	_ = godotenv.Load()
 
-	workerCount, _ := strconv.Atoi(getOrDefault("WORKER_COUNT", "0"))
-
 	return &Config{
 		DBDriver:      os.Getenv("DB_DRIVER"),
 		DBDSN:         os.Getenv("DB_DSN"),
@@ -158,7 +155,6 @@ func Load() *Config {
 		S3SecretKey:   os.Getenv("S3_SECRET_KEY"),
 		S3Endpoint:    os.Getenv("S3_ENDPOINT"),
 		S3Region:      os.Getenv("S3_REGION"),
-		WorkerCount:   workerCount,
 		ReporterType:  os.Getenv("REPORTER_TYPE"),
 		ReporterPath:  os.Getenv("REPORTER_PATH"),
 		ESUrl:         os.Getenv("ES_URL"),

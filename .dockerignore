@@ -1,0 +1,30 @@
+# The build context is sent to the daemon in full, so anything the image does not
+# need is pure upload cost — and local state that happens to be lying around
+# should not be within reach of a COPY.
+.git
+.github
+.serena
+.claude
+
+# Local build artefacts and scan state
+build/
+dist/
+*.exe
+*.db
+*.sqlite*
+coverage.out
+coverage.html
+scan-results*.json
+
+# Secrets. .env is gitignored, but a build context is not a git checkout.
+.env
+.env.*
+
+# Test scaffolding: the shell suites need a cluster or Docker, neither of which
+# exists inside an image build.
+test/
+
+# Docs
+docs/
+*.md
+!README.md
