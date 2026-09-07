@@ -19,27 +19,40 @@ const (
 )
 
 type Config struct {
-	DBDriver      string
-	DBDSN         string
-	EnableOTX     bool
-	EnableIOC     bool
-	EnableYara    bool
-	IOCPath       string
-	YARAPath      string
-	YARACmd       string
-	OTXAPIKey     string
-	S3Bucket      string
-	S3Prefix      string
-	S3AccessKey   string
-	S3SecretKey   string
-	S3Endpoint    string
-	S3Region      string
-	ReporterType  string // "json" | "elasticsearch" | "loki" | "prometheus"
-	ReporterPath  string // kalau json ke file
-	ESUrl         string // url elasticsearch
-	ESIndex       string // index elasticsearch
-	LokiURL       string // url loki
-	PrometheusURL string // url prometheus
+	DBDriver     string
+	DBDSN        string
+	EnableOTX    bool
+	EnableIOC    bool
+	EnableYara   bool
+	IOCPath      string
+	YARAPath     string
+	YARACmd      string
+	OTXAPIKey    string
+	S3Bucket     string
+	S3Prefix     string
+	S3AccessKey  string
+	S3SecretKey  string
+	S3Endpoint   string
+	S3Region     string
+	ReporterType string // "json" | "elasticsearch" | "loki" | "prometheus"
+	ReporterPath string // kalau json ke file
+	ESUrl        string // url elasticsearch
+	ESIndex      string // index elasticsearch
+	// ESUsername/ESPassword or ESAPIKey. Any Elasticsearch worth sending
+	// findings to has security on, and the reporter previously sent no
+	// credentials at all — which fails as a 401 that looks like a network fault.
+	ESUsername string
+	ESPassword string
+	ESAPIKey   string
+	// ESCACert is a path to the CA that signed the cluster certificate. ECK
+	// generates its own CA, so the system trust store does not contain it.
+	ESCACert string
+	// ESInsecureSkipVerify disables certificate verification. For a self-signed
+	// cluster on a trusted network only — it removes the guarantee that the
+	// endpoint receiving your findings is the one you meant.
+	ESInsecureSkipVerify bool
+	LokiURL              string // url loki
+	PrometheusURL        string // url prometheus
 
 	// --- staged pipeline ---
 	//
@@ -140,27 +153,32 @@ func Load() *Config {
 	_ = godotenv.Load()
 
 	return &Config{
-		DBDriver:      os.Getenv("DB_DRIVER"),
-		DBDSN:         os.Getenv("DB_DSN"),
-		EnableOTX:     os.Getenv("ENABLE_OTX") == "true",
-		EnableIOC:     os.Getenv("ENABLE_IOC") == "true",
-		EnableYara:    os.Getenv("ENABLE_YARA") == "true",
-		IOCPath:       getOrDefault("IOC_PATH", "rules/ioc/"),
-		YARAPath:      getOrDefault("YARA_PATH", "rules/yara/"),
-		YARACmd:       getOrDefault("YARA_CMD", "yara"),
-		OTXAPIKey:     os.Getenv("OTX_API_KEY"),
-		S3Bucket:      os.Getenv("S3_BUCKET"),
-		S3Prefix:      os.Getenv("S3_PREFIX"),
-		S3AccessKey:   os.Getenv("S3_ACCESS_KEY"),
-		S3SecretKey:   os.Getenv("S3_SECRET_KEY"),
-		S3Endpoint:    os.Getenv("S3_ENDPOINT"),
-		S3Region:      os.Getenv("S3_REGION"),
-		ReporterType:  os.Getenv("REPORTER_TYPE"),
-		ReporterPath:  os.Getenv("REPORTER_PATH"),
-		ESUrl:         os.Getenv("ES_URL"),
-		ESIndex:       os.Getenv("ES_INDEX"),
-		LokiURL:       os.Getenv("LOKI_URL"),
-		PrometheusURL: os.Getenv("PROMETHEUS_URL"),
+		DBDriver:             os.Getenv("DB_DRIVER"),
+		DBDSN:                os.Getenv("DB_DSN"),
+		EnableOTX:            os.Getenv("ENABLE_OTX") == "true",
+		EnableIOC:            os.Getenv("ENABLE_IOC") == "true",
+		EnableYara:           os.Getenv("ENABLE_YARA") == "true",
+		IOCPath:              getOrDefault("IOC_PATH", "rules/ioc/"),
+		YARAPath:             getOrDefault("YARA_PATH", "rules/yara/"),
+		YARACmd:              getOrDefault("YARA_CMD", "yara"),
+		OTXAPIKey:            os.Getenv("OTX_API_KEY"),
+		S3Bucket:             os.Getenv("S3_BUCKET"),
+		S3Prefix:             os.Getenv("S3_PREFIX"),
+		S3AccessKey:          os.Getenv("S3_ACCESS_KEY"),
+		S3SecretKey:          os.Getenv("S3_SECRET_KEY"),
+		S3Endpoint:           os.Getenv("S3_ENDPOINT"),
+		S3Region:             os.Getenv("S3_REGION"),
+		ReporterType:         os.Getenv("REPORTER_TYPE"),
+		ReporterPath:         os.Getenv("REPORTER_PATH"),
+		ESUrl:                os.Getenv("ES_URL"),
+		ESIndex:              os.Getenv("ES_INDEX"),
+		ESUsername:           os.Getenv("ES_USERNAME"),
+		ESPassword:           os.Getenv("ES_PASSWORD"),
+		ESAPIKey:             os.Getenv("ES_API_KEY"),
+		ESCACert:             os.Getenv("ES_CA_CERT"),
+		ESInsecureSkipVerify: os.Getenv("ES_INSECURE_SKIP_VERIFY") == "true",
+		LokiURL:              os.Getenv("LOKI_URL"),
+		PrometheusURL:        os.Getenv("PROMETHEUS_URL"),
 
 		FetchByteBudget: getBytes("FETCH_BYTE_BUDGET", 512*MB),
 		FetchMaxConns:   getInt("FETCH_MAX_CONNS", 16),

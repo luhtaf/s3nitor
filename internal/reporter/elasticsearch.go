@@ -3,9 +3,15 @@ package reporter
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/luhtaf/s3nitor/internal/config"
@@ -17,17 +23,90 @@ type ElasticsearchReporter struct {
 	url   string
 	index string
 	http  *http.Client
+
+	// Exactly one of these is used, API key first. Held rather than baked into
+	// a RoundTripper so the value never lands in a logged request dump.
+	apiKey   string
+	username string
+	password string
 }
 
 func NewElasticsearchReporter(cfg *config.Config) (*ElasticsearchReporter, error) {
 	if cfg.ESUrl == "" || cfg.ESIndex == "" {
 		return nil, fmt.Errorf("invalid elasticsearch config: url=%s index=%s", cfg.ESUrl, cfg.ESIndex)
 	}
-	return &ElasticsearchReporter{
-		url:   cfg.ESUrl,
-		index: cfg.ESIndex,
-		http:  &http.Client{Timeout: 30 * time.Second},
-	}, nil
+	transport, err := esTransport(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	r := &ElasticsearchReporter{
+		url:      strings.TrimRight(cfg.ESUrl, "/"),
+		index:    cfg.ESIndex,
+		http:     &http.Client{Timeout: 30 * time.Second, Transport: transport},
+		apiKey:   cfg.ESAPIKey,
+		username: cfg.ESUsername,
+		password: cfg.ESPassword,
+	}
+
+	// Best-effort, before the first document: an index born with dynamic
+	// mapping cannot be aggregated over, and by the time anyone notices there
+	// is data in it that would have to be reindexed.
+	if err := r.EnsureTemplate(context.Background()); err != nil {
+		log.Printf("elasticsearch: %v (findings will still be written)", err)
+	}
+	return r, nil
+}
+
+// esTransport configures TLS for the cluster certificate.
+//
+// A managed Elasticsearch — ECK, for instance — signs its HTTP certificate with
+// a CA it generated itself, which is not in the system trust store. Without
+// either that CA or an explicit opt-out, every request fails certificate
+// verification, and the error reads like a network problem rather than a
+// configuration one.
+func esTransport(cfg *config.Config) (http.RoundTripper, error) {
+	if cfg.ESCACert == "" && !cfg.ESInsecureSkipVerify {
+		return http.DefaultTransport, nil
+	}
+
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+
+	if cfg.ESCACert != "" {
+		pem, err := os.ReadFile(cfg.ESCACert)
+		if err != nil {
+			return nil, fmt.Errorf("reading ES_CA_CERT: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("ES_CA_CERT %q contains no usable certificate", cfg.ESCACert)
+		}
+		tlsCfg.RootCAs = pool
+	}
+
+	if cfg.ESInsecureSkipVerify {
+		// Announced, because a silent opt-out of verification is how a
+		// misdirected endpoint goes unnoticed.
+		log.Printf("elasticsearch: TLS verification disabled by ES_INSECURE_SKIP_VERIFY")
+		tlsCfg.InsecureSkipVerify = true
+	}
+
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.TLSClientConfig = tlsCfg
+	return t, nil
+}
+
+// authorize attaches credentials, preferring an API key over a password.
+//
+// An API key can be scoped to just the index this writes to; the elastic
+// superuser cannot be scoped at all.
+func (r *ElasticsearchReporter) authorize(req *http.Request) {
+	switch {
+	case r.apiKey != "":
+		req.Header.Set("Authorization", "ApiKey "+r.apiKey)
+	case r.username != "":
+		req.SetBasicAuth(r.username, r.password)
+	}
 }
 
 // Report indexes a single finding under its deterministic id, so a replayed
@@ -44,6 +123,7 @@ func (r *ElasticsearchReporter) Report(ctx context.Context, f *scanner.Finding) 
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	r.authorize(req)
 
 	resp, err := r.http.Do(req)
 	if err != nil {
@@ -52,9 +132,22 @@ func (r *ElasticsearchReporter) Report(ctx context.Context, f *scanner.Finding) 
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("elasticsearch: %s", resp.Status)
+		return fmt.Errorf("elasticsearch: %s: %s", resp.Status, snippet(resp))
 	}
 	return nil
+}
+
+// snippet returns a little of the error body.
+//
+// Elasticsearch explains refusals in the body — a mapping conflict, a missing
+// privilege — and reporting only the status code turns a precise message into
+// a bare "403 Forbidden".
+func snippet(resp *http.Response) string {
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if err != nil || len(b) == 0 {
+		return "no body"
+	}
+	return strings.TrimSpace(string(b))
 }
 
 // ReportBatch writes the whole batch in one _bulk request.
@@ -86,6 +179,7 @@ func (r *ElasticsearchReporter) ReportBatch(ctx context.Context, batch []*scanne
 		return err
 	}
 	req.Header.Set("Content-Type", "application/x-ndjson")
+	r.authorize(req)
 
 	resp, err := r.http.Do(req)
 	if err != nil {
@@ -94,7 +188,7 @@ func (r *ElasticsearchReporter) ReportBatch(ctx context.Context, batch []*scanne
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("elasticsearch bulk: %s", resp.Status)
+		return fmt.Errorf("elasticsearch bulk: %s: %s", resp.Status, snippet(resp))
 	}
 
 	// A bulk request returns 200 even when individual documents failed, so the

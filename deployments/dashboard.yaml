@@ -1,0 +1,56 @@
+# Read-only dashboard, deployed beside the scanner.
+#
+# Separate from the scan Job because the lifecycles differ: the scanner is
+# one-shot, this runs continuously. It also has a wider audience, which is the
+# reason it holds no write path at all.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3nitor-dashboard
+  labels: { app.kubernetes.io/name: s3nitor-dashboard }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: s3nitor-dashboard }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: s3nitor-dashboard }
+    spec:
+      imagePullSecrets: [{ name: ghcr }]
+      containers:
+        - name: dashboard
+          image: ghcr.io/luhtaf/s3nitor:try
+          imagePullPolicy: Always
+          command: ["./s3nitor-dashboard"]
+          env:
+            - { name: DASHBOARD_ADDR, value: ":8081" }
+            - { name: ES_URL,   value: "http://elk-th-new-es-http:9200" }
+            - { name: ES_INDEX, value: "s3nitor-findings" }
+            - { name: ES_USERNAME, value: "elastic" }
+            - name: ES_PASSWORD
+              valueFrom: { secretKeyRef: { name: elk-th-new-es-elastic-user, key: elastic } }
+            # No DB_DSN: the scan Job writes its ledger to an emptyDir that dies
+            # with the pod, so there is nothing here to read. The queue panel
+            # says so rather than showing an empty table that looks like "no
+            # backlog". Point both at one PVC to turn it on.
+          ports: [{ containerPort: 8081, name: http }]
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8081 }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m,  memory: 64Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3nitor-dashboard
+spec:
+  selector: { app.kubernetes.io/name: s3nitor-dashboard }
+  ports: [{ name: http, port: 80, targetPort: 8081 }]

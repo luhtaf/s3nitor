@@ -1,0 +1,618 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>s3nitor</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg:#F2F4F6; --surface:#FFFFFF; --sunken:#E8ECF0; --line:#D5DCE3; --hair:#E6EBF0;
+    --ink:#141A21; --ink-2:#3C4854; --muted:#66727F;
+    --accent:#1F5FA8; --accent-w:#E2ECF8;
+    /* Status palette: reserved for severity, never reused as a series colour.
+       Each is always shown with its label, since two of them sit under 3:1 on a
+       light surface and must not carry meaning by hue alone. */
+    --sev-info:#66727F; --sev-low:#fab219; --sev-medium:#ec835a;
+    --sev-high:#d03b3b; --sev-critical:#8E1F1F;
+    /* Chart series use an ordinal ramp, not the status colours above.
+       Severity is an ordered dimension, and a single-hue ramp encodes that order
+       — four unrelated hues never did. It also passes the checks the status
+       colours cannot when stacked: as adjacent segments, low's amber and
+       medium's orange measure normal-vision deltaE 13.6, under the 15 floor, so
+       they are genuinely hard to separate. The chips keep the status palette,
+       where each is shown beside its own label and red-for-critical earns its
+       place. */
+    --ramp-info:#86b6ef; --ramp-low:#5598e7; --ramp-medium:#2a78d6;
+    --ramp-high:#1c5cab; --ramp-critical:#104281;
+    --good:#0ca30c;
+    --grid:#E3E9EF;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg:#0B0F13; --surface:#141A20; --sunken:#1B232B; --line:#2A343E; --hair:#212A33;
+      --ink:#DEE5EC; --ink-2:#B2BDC8; --muted:#8695A3;
+      --accent:#78AEEA; --accent-w:#152436;
+      --sev-info:#8695A3; --sev-low:#fab219; --sev-medium:#ec835a;
+      --sev-high:#e06060; --sev-critical:#f08a8a;
+      /* Dark: the ramp reverses so the most severe stays the most prominent,
+         and stops at step 600 — the documented floor against a dark surface. */
+      --ramp-info:#184f95; --ramp-low:#256abf; --ramp-medium:#3987e5;
+      --ramp-high:#6da7ec; --ramp-critical:#9ec5f4;
+      --good:#3ec93e;
+      --grid:#232C35;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg:#0B0F13; --surface:#141A20; --sunken:#1B232B; --line:#2A343E; --hair:#212A33;
+    --ink:#DEE5EC; --ink-2:#B2BDC8; --muted:#8695A3;
+    --accent:#78AEEA; --accent-w:#152436;
+    --sev-info:#8695A3; --sev-low:#fab219; --sev-medium:#ec835a;
+    --sev-high:#e06060; --sev-critical:#f08a8a;
+    /* Dark: the ramp reverses so the most severe stays the most prominent,
+       and stops at step 600 — the documented floor against a dark surface. */
+    --ramp-info:#184f95; --ramp-low:#256abf; --ramp-medium:#3987e5;
+    --ramp-high:#6da7ec; --ramp-critical:#9ec5f4;
+    --good:#3ec93e;
+    --grid:#232C35;
+  }
+
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .wrap{max-width:1240px;margin:0 auto;padding:0 20px}
+
+  header{background:var(--surface);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20}
+  .bar{display:flex;align-items:center;gap:16px;padding:13px 0}
+  .brand{font-weight:700;font-size:16px;letter-spacing:-.02em;display:flex;align-items:center;gap:8px}
+  .brand .dot{width:8px;height:8px;border-radius:50%;background:var(--accent)}
+  .meta{margin-left:auto;display:flex;align-items:center;gap:14px;color:var(--muted);font-size:12.5px}
+  .ro{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;
+    padding:2px 7px;border-radius:4px;background:var(--sunken);border:1px solid var(--hair);color:var(--muted)}
+
+  nav{display:flex;gap:2px;border-bottom:1px solid var(--line);background:var(--surface)}
+  nav .wrap{display:flex;gap:2px;padding:0 20px}
+  nav button{background:none;border:none;border-bottom:2px solid transparent;color:var(--muted);
+    padding:11px 15px;font:inherit;font-weight:560;cursor:pointer;white-space:nowrap}
+  nav button:hover{color:var(--ink)}
+  nav button[aria-selected="true"]{color:var(--accent);border-bottom-color:var(--accent)}
+  nav button .count{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--muted);margin-left:6px}
+
+  main{padding:22px 0 70px}
+  .panel{display:none}
+  .panel.on{display:block}
+
+  /* filters live in one row above the content, so a filter set reads as one
+     statement rather than as controls scattered through the page */
+  .filters{display:flex;flex-wrap:wrap;gap:9px;align-items:center;margin:0 0 18px}
+  input[type=search],select{background:var(--surface);color:var(--ink);border:1px solid var(--line);
+    border-radius:7px;padding:7px 10px;font:inherit;font-size:13.5px}
+  input[type=search]{min-width:250px;flex:1}
+  input[type=search]:focus,select:focus,button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .btn{background:var(--surface);color:var(--ink-2);border:1px solid var(--line);border-radius:7px;
+    padding:7px 12px;font:inherit;font-size:13px;cursor:pointer}
+  .btn:hover{background:var(--sunken)}
+  .btn.clear{color:var(--muted)}
+
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:11px;margin:0 0 20px}
+  .card{background:var(--surface);border:1px solid var(--hair);border-radius:10px;padding:13px 15px}
+  .card .n{font-family:ui-monospace,Menlo,monospace;font-size:25px;font-weight:600;letter-spacing:-.02em;
+    font-variant-numeric:tabular-nums;display:block;line-height:1.2}
+  .card .l{font-size:12px;color:var(--muted);display:block;margin-top:2px}
+  .card.alarm .n{color:var(--sev-high)}
+  .card.gap .n{color:var(--sev-medium)}
+
+  .box{background:var(--surface);border:1px solid var(--hair);border-radius:10px;overflow:hidden}
+  .box h2{margin:0;padding:12px 16px;font-size:13.5px;font-weight:640;border-bottom:1px solid var(--hair);
+    background:var(--sunken)}
+  .scroll{overflow-x:auto}
+  table{border-collapse:collapse;width:100%;font-size:13.5px;min-width:820px}
+  th,td{text-align:left;padding:9px 14px;border-bottom:1px solid var(--hair);vertical-align:top}
+  thead th{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;
+    color:var(--muted);background:var(--sunken);font-weight:600;white-space:nowrap;position:sticky;top:0}
+  thead th.sortable{cursor:pointer;user-select:none}
+  thead th.sortable:hover{color:var(--ink)}
+  thead th .arrow{opacity:.45;margin-left:3px}
+  thead th[aria-sort] .arrow{opacity:1;color:var(--accent)}
+  tbody tr:hover{background:var(--sunken)}
+  tbody tr.open{background:var(--accent-w)}
+  td.num{font-family:ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+  td.k{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;word-break:break-all;max-width:400px}
+  tr.row{cursor:pointer}
+
+  .chip{display:inline-flex;align-items:center;gap:5px;font-family:ui-monospace,Menlo,monospace;font-size:10.5px;
+    letter-spacing:.05em;text-transform:uppercase;padding:2px 7px;border-radius:4px;font-weight:600;white-space:nowrap}
+  .chip::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;flex:none}
+  .sev-info{color:var(--sev-info)}      .sev-low{color:var(--sev-low)}
+  .sev-medium{color:var(--sev-medium)}  .sev-high{color:var(--sev-high)}
+  .sev-critical{color:var(--sev-critical)}
+  .hit{color:var(--sev-high);font-weight:640}
+  .clean{color:var(--muted)}
+
+  .detail{background:var(--sunken)}
+  .detail pre{margin:0;padding:12px 16px;font-family:ui-monospace,Menlo,monospace;font-size:12px;
+    line-height:1.55;overflow-x:auto;color:var(--ink-2)}
+
+  .pager{display:flex;align-items:center;gap:12px;padding:10px 16px;border-top:1px solid var(--hair);
+    color:var(--muted);font-size:12.5px}
+  .pager .spacer{margin-left:auto}
+
+  .state{padding:34px 20px;text-align:center;color:var(--muted)}
+  .state strong{display:block;color:var(--ink);font-size:15px;margin-bottom:5px}
+  .state.err strong{color:var(--sev-high)}
+  .state code{font-family:ui-monospace,Menlo,monospace;font-size:12px;background:var(--sunken);
+    padding:2px 6px;border-radius:4px;display:inline-block;margin-top:8px;max-width:100%;word-break:break-all}
+
+  figure{margin:0}
+  figcaption{font-size:12.5px;color:var(--muted);padding:10px 16px 14px}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;padding:11px 16px 0;font-size:12.5px;color:var(--ink-2)}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .legend i{width:10px;height:10px;border-radius:2px;display:inline-block}
+  .chartwrap{position:relative;padding:6px 8px 0}
+  svg{display:block;width:100%;height:auto}
+  .tip{position:fixed;pointer-events:none;background:var(--surface);border:1px solid var(--line);
+    border-radius:7px;padding:8px 11px;font-size:12.5px;box-shadow:0 6px 22px rgba(0,0,0,.16);z-index:60;
+    display:none;min-width:150px}
+  .tip .t{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--muted);margin-bottom:5px}
+  .tip .r{display:flex;justify-content:space-between;gap:14px}
+  .tip .r b{font-variant-numeric:tabular-nums}
+  .grid line{stroke:var(--grid);stroke-width:1}
+  .axis text{fill:var(--muted);font-size:10.5px;font-family:ui-monospace,Menlo,monospace}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap bar">
+    <span class="brand"><span class="dot"></span>s3nitor</span>
+    <span class="ro">read only</span>
+    <div class="meta">
+      <span id="lastScan">—</span>
+      <button class="btn" id="refresh" title="Reload (r)">Refresh</button>
+    </div>
+  </div>
+</header>
+
+<nav>
+  <div class="wrap">
+    <button id="tab-findings" aria-selected="true">Findings<span class="count" id="cnt-findings"></span></button>
+    <button id="tab-trends" aria-selected="false">Trends</button>
+    <button id="tab-coverage" aria-selected="false">Coverage &amp; queue<span class="count" id="cnt-gaps"></span></button>
+  </div>
+</nav>
+
+<main class="wrap">
+
+  <div class="filters">
+    <input type="search" id="q" placeholder="Search object key…  (press /)" autocomplete="off">
+    <select id="scanner"><option value="">Every scanner</option></select>
+    <select id="severity">
+      <option value="">Every severity</option>
+      <option value="critical">critical</option><option value="high">high</option>
+      <option value="medium">medium</option><option value="low">low</option>
+      <option value="info">info</option>
+    </select>
+    <select id="match">
+      <option value="">Matches and clean</option>
+      <option value="true">Matches only</option>
+      <option value="false">Clean only</option>
+    </select>
+    <select id="since">
+      <option value="">All time</option>
+      <option value="now-1h">Last hour</option>
+      <option value="now-24h">Last 24 hours</option>
+      <option value="now-7d">Last 7 days</option>
+      <option value="now-30d">Last 30 days</option>
+    </select>
+    <button class="btn clear" id="clear">Clear</button>
+  </div>
+
+  <!-- Findings: the default view, because "what was found" is the question -->
+  <section class="panel on" id="panel-findings">
+    <div class="cards" id="cards"></div>
+    <div class="box">
+      <div class="scroll">
+        <table id="tbl">
+          <thead><tr>
+            <th class="sortable" data-f="key">Object<span class="arrow">↕</span></th>
+            <th class="sortable" data-f="scanner">Scanner<span class="arrow">↕</span></th>
+            <th class="sortable" data-f="match">Result<span class="arrow">↕</span></th>
+            <th class="sortable" data-f="severity">Severity<span class="arrow">↕</span></th>
+            <th class="sortable" data-f="size">Size<span class="arrow">↕</span></th>
+            <th class="sortable" data-f="scanned_at">Scanned<span class="arrow">↕</span></th>
+          </tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+      <div id="tblState"></div>
+      <div class="pager">
+        <span id="range">—</span>
+        <span class="spacer"></span>
+        <button class="btn" id="prev">Previous</button>
+        <button class="btn" id="next">Next</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-trends">
+    <div class="box">
+      <h2>Findings over time, by severity</h2>
+      <div class="filters" style="padding:12px 16px 0;margin:0">
+        <select id="interval">
+          <option value="minute">Per minute</option>
+          <option value="hour" selected>Per hour</option>
+          <option value="day">Per day</option>
+          <option value="week">Per week</option>
+        </select>
+      </div>
+      <div class="legend" id="legend"></div>
+      <div class="chartwrap"><figure><div id="chart"></div></figure></div>
+      <figcaption id="chartCap"></figcaption>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-coverage">
+    <div class="box" style="margin-bottom:18px">
+      <h2>Objects that were not scanned</h2>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Object</th><th>Size</th><th>Limit</th><th>Reason</th><th>Seen</th></tr></thead>
+          <tbody id="gapRows"></tbody>
+        </table>
+      </div>
+      <div id="gapState"></div>
+    </div>
+    <div class="box">
+      <h2>Scan queue</h2>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Scanner</th><th>Status</th><th>Tasks</th><th>Next attempt</th></tr></thead>
+          <tbody id="queueRows"></tbody>
+        </table>
+      </div>
+      <div id="queueState"></div>
+    </div>
+  </section>
+
+</main>
+
+<div class="tip" id="tip"></div>
+
+<script>
+(() => {
+  "use strict";
+  const $ = s => document.querySelector(s);
+  const SEV = ["critical","high","medium","low","info"];
+  // Chips read the status palette; chart series read the ordinal ramp. Two
+  // encodings because they answer different questions — "how bad is this row"
+  // versus "how is the mix changing" — and the chart legend names each series,
+  // so nobody has to carry a colour across views.
+  const cssVar = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const sevColor  = s => cssVar("--sev-" + s)  || "#66727F";
+  const rampColor = s => cssVar("--ramp-" + s) || "#2a78d6";
+
+  const state = {
+    tab: "findings",
+    from: 0, size: 50, sort: "scanned_at", order: "desc",
+    total: 0, open: null,
+  };
+
+  const filters = () => {
+    const p = new URLSearchParams();
+    for (const [k, el] of [["q","#q"],["scanner","#scanner"],["severity","#severity"],
+                           ["match","#match"],["since","#since"]]) {
+      const v = $(el).value.trim();
+      if (v) p.set(k, v);
+    }
+    return p;
+  };
+
+  async function api(path, extra = {}) {
+    const p = filters();
+    for (const [k, v] of Object.entries(extra)) if (v !== "" && v != null) p.set(k, v);
+    const res = await fetch(`/api/${path}?${p}`);
+    const body = await res.json().catch(() => ({ error: "response was not JSON" }));
+    if (!res.ok) throw new Error(body.error || res.statusText);
+    return body;
+  }
+
+  const esc = s => String(s ?? "").replace(/[&<>"]/g, c =>
+    ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
+
+  const bytes = n => {
+    if (!n && n !== 0) return "—";
+    const u = ["B","KiB","MiB","GiB","TiB"];
+    let i = 0, v = n;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return (i === 0 ? v : v.toFixed(1)) + " " + u[i];
+  };
+
+  const when = iso => {
+    if (!iso) return "—";
+    const d = new Date(iso), s = (Date.now() - d) / 1000;
+    if (s < 60) return "just now";
+    if (s < 3600) return Math.floor(s / 60) + "m ago";
+    if (s < 86400) return Math.floor(s / 3600) + "h ago";
+    return d.toLocaleDateString() + " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  };
+
+  const stateBox = (el, title, detail, isErr) => {
+    el.innerHTML = title
+      ? `<div class="state${isErr ? " err" : ""}"><strong>${esc(title)}</strong>${
+          detail ? `<code>${esc(detail)}</code>` : ""}</div>`
+      : "";
+  };
+
+  // ---- Findings ----------------------------------------------------------
+  async function loadFindings() {
+    try {
+      const [sum, page] = await Promise.all([
+        api("summary"),
+        api("findings", { from: state.from, size: state.size, sort: state.sort, order: state.order }),
+      ]);
+      state.total = page.total;
+
+      $("#lastScan").textContent = sum.last_scan ? "last scan " + when(sum.last_scan) : "no scans yet";
+      $("#cnt-findings").textContent = sum.findings ? sum.findings.toLocaleString() : "";
+      $("#cnt-gaps").textContent = sum.gaps ? sum.gaps.toLocaleString() : "";
+
+      $("#cards").innerHTML = [
+        ["Objects scanned", sum.objects, ""],
+        ["Findings", sum.findings, ""],
+        ["Matches", sum.matches, sum.matches ? "alarm" : ""],
+        ["Not scanned", sum.gaps, sum.gaps ? "gap" : ""],
+        ["Scanner errors", sum.errors, sum.errors ? "alarm" : ""],
+      ].map(([l, n, cls]) =>
+        `<div class="card ${cls}"><span class="n">${(n || 0).toLocaleString()}</span><span class="l">${l}</span></div>`
+      ).join("");
+
+      // Scanner options are discovered from the data rather than hard-coded, so
+      // a newly added scanner appears without a UI change.
+      const sel = $("#scanner");
+      const names = Object.keys(sum.by_scanner || {}).sort();
+      if (sel.dataset.names !== names.join(",")) {
+        sel.dataset.names = names.join(",");
+        const cur = sel.value;
+        sel.innerHTML = `<option value="">Every scanner</option>` +
+          names.map(n => `<option value="${esc(n)}">${esc(n)} (${sum.by_scanner[n]})</option>`).join("");
+        sel.value = cur;
+      }
+
+      renderRows(page.items);
+      const shown = page.items.length;
+      $("#range").textContent = state.total
+        ? `${state.from + 1}–${state.from + shown} of ${state.total.toLocaleString()}`
+        : "nothing to show";
+      $("#prev").disabled = state.from === 0;
+      $("#next").disabled = state.from + state.size >= state.total;
+      stateBox($("#tblState"), shown ? "" :
+        (filters().toString() ? "No findings match these filters" : "Nothing scanned yet"),
+        shown ? "" : (filters().toString() ? "Clear the filters to see everything" :
+          "Upload an object and run a scan; findings appear here"), false);
+    } catch (e) {
+      $("#rows").innerHTML = "";
+      stateBox($("#tblState"), "Could not reach Elasticsearch", e.message, true);
+    }
+  }
+
+  function renderRows(items) {
+    $("#rows").innerHTML = items.map((f, i) => {
+      const sev = SEV.includes(f.severity) ? f.severity : "info";
+      const result = f.error ? `<span class="hit">error</span>`
+        : f.match ? `<span class="hit">match</span>` : `<span class="clean">clean</span>`;
+      const detail = JSON.stringify(
+        { detail: f.detail || {}, hashes: f.hashes || {}, file_id: f.file_id,
+          bucket: f.bucket, error: f.error || undefined }, null, 2);
+      return `<tr class="row${state.open === i ? " open" : ""}" data-i="${i}">
+          <td class="k">${esc(f.key)}</td>
+          <td class="mono">${esc(f.scanner)}</td>
+          <td>${result}</td>
+          <td><span class="chip sev-${sev}">${esc(sev)}</span></td>
+          <td class="num">${bytes(f.size)}</td>
+          <td class="num" title="${esc(f.scanned_at)}">${when(f.scanned_at)}</td>
+        </tr>` + (state.open === i
+          ? `<tr class="detail"><td colspan="6"><pre>${esc(detail)}</pre></td></tr>` : "");
+    }).join("");
+
+    for (const tr of document.querySelectorAll("#rows tr.row")) {
+      tr.onclick = () => {
+        const i = Number(tr.dataset.i);
+        state.open = state.open === i ? null : i;
+        renderRows(items);
+      };
+    }
+  }
+
+  // ---- Trends ------------------------------------------------------------
+  async function loadTrends() {
+    const cap = $("#chartCap"), host = $("#chart");
+    try {
+      const data = await api("trends", { interval: $("#interval").value });
+      const present = SEV.filter(s => data.some(b => (b.by_severity || {})[s] > 0));
+
+      if (!data.length || !present.length) {
+        host.innerHTML = "";
+        $("#legend").innerHTML = "";
+        cap.innerHTML = `<div class="state"><strong>No findings in this range</strong>Widen the time filter, or run a scan</div>`;
+        return;
+      }
+
+      // Legend is always present for two or more series, so identity never rests
+      // on colour alone.
+      $("#legend").innerHTML = present.map(s =>
+        `<span><i style="background:${rampColor(s)}"></i>${s}</span>`).join("");
+
+      host.innerHTML = stackedBars(data, present);
+      const total = data.reduce((a, b) => a + b.total, 0);
+      cap.textContent = `${total.toLocaleString()} findings across ${data.length} intervals. `
+        + `Bars stack by severity; hover for the breakdown.`;
+    } catch (e) {
+      host.innerHTML = "";
+      stateBox(cap, "Could not load trends", e.message, true);
+    }
+  }
+
+  // Stacked bars, hand-drawn as SVG: one axis, thin marks, a 2px surface gap
+  // between stacked segments so adjacent severities stay separable.
+  function stackedBars(data, series) {
+    const W = 1000, H = 260, padL = 46, padR = 12, padT = 12, padB = 30;
+    const iw = W - padL - padR, ih = H - padT - padB;
+    const max = Math.max(1, ...data.map(b => b.total));
+
+    const ticks = 4, gridY = [];
+    for (let i = 0; i <= ticks; i++) {
+      const v = Math.round(max * i / ticks), y = padT + ih - (v / max) * ih;
+      gridY.push(`<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}"/>
+        <text x="${padL - 8}" y="${y + 3.5}" text-anchor="end">${v}</text>`);
+    }
+
+    const bw = Math.max(2, Math.min(34, iw / data.length - 3));
+    const bars = data.map((b, i) => {
+      const x = padL + (i + 0.5) * (iw / data.length) - bw / 2;
+      let y = padT + ih, out = "";
+      for (const s of series) {
+        const v = (b.by_severity || {})[s] || 0;
+        if (!v) continue;
+        const h = (v / max) * ih;
+        y -= h;
+        // 2px surface gap between segments; the top segment gets rounded ends.
+        out += `<rect x="${x}" y="${y}" width="${bw}" height="${Math.max(1, h - 2)}"
+                  rx="2" fill="${rampColor(s)}"/>`;
+      }
+      const label = new Date(b.time).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit" });
+      const rows = series.map(s => ({ s, v: (b.by_severity || {})[s] || 0 })).filter(r => r.v);
+      return `<g class="bar" data-label="${esc(label)}" data-total="${b.total}"
+                 data-rows='${esc(JSON.stringify(rows))}'>
+          <rect x="${x - 2}" y="${padT}" width="${bw + 4}" height="${ih}" fill="transparent"/>
+          ${out}
+        </g>`;
+    }).join("");
+
+    const every = Math.ceil(data.length / 8);
+    const xlabels = data.map((b, i) => i % every ? "" : (() => {
+      const x = padL + (i + 0.5) * (iw / data.length);
+      const t = new Date(b.time).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit" });
+      return `<text x="${x}" y="${H - 9}" text-anchor="middle">${esc(t)}</text>`;
+    })()).join("");
+
+    setTimeout(bindHover, 0);
+    return `<svg viewBox="0 0 ${W} ${H}" role="img"
+              aria-label="Findings per interval, stacked by severity">
+        <g class="grid">${gridY.join("")}</g>
+        <g class="axis">${xlabels}</g>
+        ${bars}
+      </svg>`;
+  }
+
+  function bindHover() {
+    const tip = $("#tip");
+    for (const g of document.querySelectorAll("#chart .bar")) {
+      g.onmousemove = ev => {
+        const rows = JSON.parse(g.dataset.rows || "[]");
+        tip.innerHTML = `<div class="t">${esc(g.dataset.label)}</div>` +
+          rows.map(r => `<div class="r"><span style="color:${rampColor(r.s)}">${r.s}</span><b>${r.v}</b></div>`).join("") +
+          `<div class="r" style="margin-top:4px;border-top:1px solid var(--hair);padding-top:4px">
+             <span>total</span><b>${esc(g.dataset.total)}</b></div>`;
+        tip.style.display = "block";
+        tip.style.left = Math.min(ev.clientX + 14, innerWidth - 190) + "px";
+        tip.style.top = (ev.clientY + 14) + "px";
+      };
+      g.onmouseleave = () => { tip.style.display = "none"; };
+    }
+  }
+
+  // ---- Coverage & queue --------------------------------------------------
+  async function loadCoverage() {
+    try {
+      const gaps = await api("coverage", { limit: 200 });
+      $("#gapRows").innerHTML = gaps.map(g => `<tr>
+          <td class="k">${esc(g.key)}</td>
+          <td class="num">${bytes(g.size)}</td>
+          <td class="num">${bytes(g.limit)}</td>
+          <td class="mono">${esc(g.reason)}</td>
+          <td class="num">${when(g.scanned_at)}</td>
+        </tr>`).join("");
+      stateBox($("#gapState"), gaps.length ? "" : "Everything in range was scanned",
+        gaps.length ? "" : "Objects skipped by MAX_OBJECT_SIZE would be listed here", false);
+    } catch (e) {
+      $("#gapRows").innerHTML = "";
+      stateBox($("#gapState"), "Could not load coverage", e.message, true);
+    }
+
+    try {
+      const q = await api("queue");
+      if (!q.available) {
+        $("#queueRows").innerHTML = "";
+        stateBox($("#queueState"), "Queue unavailable", q.reason, false);
+        return;
+      }
+      $("#queueRows").innerHTML = (q.rows || []).map(r => `<tr>
+          <td class="mono">${esc(r.scanner)}</td>
+          <td class="mono">${esc(r.status)}</td>
+          <td class="num">${(r.count || 0).toLocaleString()}</td>
+          <td class="num">${r.oldest ? when(r.oldest) : "—"}</td>
+        </tr>`).join("");
+      stateBox($("#queueState"), (q.rows || []).length ? "" : "Nothing queued",
+        (q.rows || []).length ? "" : "Tasks parked by a rate-limited scanner would appear here", false);
+    } catch (e) {
+      $("#queueRows").innerHTML = "";
+      stateBox($("#queueState"), "Could not load the queue", e.message, true);
+    }
+  }
+
+  // ---- wiring ------------------------------------------------------------
+  const reload = () => {
+    if (state.tab === "findings") loadFindings();
+    else if (state.tab === "trends") loadTrends();
+    else loadCoverage();
+  };
+
+  function selectTab(name) {
+    state.tab = name;
+    for (const t of ["findings", "trends", "coverage"]) {
+      $("#tab-" + t).setAttribute("aria-selected", String(t === name));
+      $("#panel-" + t).classList.toggle("on", t === name);
+    }
+    reload();
+  }
+  for (const t of ["findings", "trends", "coverage"]) $("#tab-" + t).onclick = () => selectTab(t);
+
+  let debounce;
+  $("#q").oninput = () => { clearTimeout(debounce); debounce = setTimeout(() => { state.from = 0; reload(); }, 280); };
+  for (const s of ["#scanner", "#severity", "#match", "#since"])
+    $(s).onchange = () => { state.from = 0; state.open = null; reload(); };
+  $("#interval").onchange = loadTrends;
+  $("#refresh").onclick = reload;
+  $("#clear").onclick = () => {
+    for (const s of ["#q", "#scanner", "#severity", "#match", "#since"]) $(s).value = "";
+    state.from = 0; state.open = null; reload();
+  };
+  $("#prev").onclick = () => { state.from = Math.max(0, state.from - state.size); state.open = null; loadFindings(); };
+  $("#next").onclick = () => { state.from += state.size; state.open = null; loadFindings(); };
+
+  for (const th of document.querySelectorAll("th.sortable")) {
+    th.onclick = () => {
+      const f = th.dataset.f;
+      state.order = (state.sort === f && state.order === "desc") ? "asc" : "desc";
+      state.sort = f; state.from = 0; state.open = null;
+      for (const o of document.querySelectorAll("th.sortable")) o.removeAttribute("aria-sort");
+      th.setAttribute("aria-sort", state.order === "asc" ? "ascending" : "descending");
+      th.querySelector(".arrow").textContent = state.order === "asc" ? "↑" : "↓";
+      loadFindings();
+    };
+  }
+
+  addEventListener("keydown", e => {
+    if (e.key === "/" && document.activeElement !== $("#q")) { e.preventDefault(); $("#q").focus(); }
+    if (e.key === "r" && !/input|select/i.test(document.activeElement.tagName)) reload();
+  });
+
+  selectTab("findings");
+})();
+</script>
+</body>
+</html>

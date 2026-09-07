@@ -1,0 +1,69 @@
+# One-shot scan, run inside the cluster.
+#
+# In-cluster the services are reachable by name, so there are no port-forwards
+# and the endpoints are the same ones a permanent deployment would use.
+#
+#   kubectl --context kubeth -n default delete job s3nitor-scan --ignore-not-found
+#   kubectl --context kubeth -n default apply -f deployments/scan-job.yaml
+#   kubectl --context kubeth -n default logs -f job/s3nitor-scan
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: s3nitor-scan
+spec:
+  # No retries: a failed scan should be read, not silently repeated.
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: ghcr
+      containers:
+        - name: s3scanner
+          image: ghcr.io/luhtaf/s3nitor:try
+          imagePullPolicy: Always
+          env:
+            # Ledger on an emptyDir: this Job is a one-shot demo, so every run
+            # rescans. A PVC here instead would make dedup persist between runs.
+            - { name: DB_DRIVER, value: sqlite3 }
+            - { name: DB_DSN,    value: /tmp/scan.db }
+
+            - { name: S3_ENDPOINT, value: "http://minio:9000" }
+            - { name: S3_BUCKET,   value: "s3nitor-try" }
+            - { name: AWS_REGION,  value: us-east-1 }
+            - { name: AWS_EC2_METADATA_DISABLED, value: "true" }
+            - name: S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: minio-creds, key: MINIO_ROOT_USER } }
+            - name: S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: minio-creds, key: MINIO_ROOT_PASSWORD } }
+
+            - { name: SOURCE_MODE, value: lister }
+            - { name: ENABLE_IOC,  value: "true" }
+            # yara is installed in the image, and rules/ ships with it.
+            - { name: ENABLE_YARA, value: "true" }
+            - { name: ENABLE_OTX,  value: "false" }
+            - { name: ENABLE_VT,   value: "false" }
+
+            - { name: REPORTER_TYPE, value: elasticsearch }
+            # TLS is disabled on this cluster's HTTP layer
+            # (selfSignedCertificate.disabled), so plain http and no CA.
+            - { name: ES_URL,      value: "http://elk-th-new-es-http:9200" }
+            - { name: ES_INDEX,    value: "s3nitor-findings" }
+            - { name: ES_USERNAME, value: "elastic" }
+            - name: ES_PASSWORD
+              valueFrom: { secretKeyRef: { name: elk-th-new-es-elastic-user, key: elastic } }
+
+            - { name: METRICS_ADDR, value: ":8080" }
+          ports:
+            - { containerPort: 8080, name: metrics }
+          resources:
+            # Measured at ~25 MiB peak on a small bucket; the request has room
+            # for the byte budget below, and the limit is deliberately above it
+            # so an overshoot shows up as a metric rather than an OOM kill.
+            requests: { cpu: 200m, memory: 256Mi }
+            limits:   { cpu: "2",  memory: 1Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # the scanner writes temp payloads
+            capabilities: { drop: ["ALL"] }

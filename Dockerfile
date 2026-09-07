@@ -24,6 +24,14 @@ RUN CGO_ENABLED=1 GOOS=linux go build \
       -ldflags "-s -w -X main.Version=${VERSION}" \
       -o /out/s3scanner ./cmd/s3scanner
 
+# The dashboard ships in the same image, selected by overriding the command.
+# One image rather than two: they share the config and the Finding type, so a
+# single build cannot drift between what writes findings and what reads them.
+RUN CGO_ENABLED=1 GOOS=linux go build \
+      -trimpath \
+      -ldflags "-s -w -X main.Version=${VERSION}" \
+      -o /out/s3nitor-dashboard ./cmd/s3nitor-dashboard
+
 # Prove the binary can open a database before it ships. A green build is not
 # evidence of a working binary here: the cgo failure mode only appears at
 # runtime, and this is the cheapest place to catch a regression.
@@ -50,12 +58,18 @@ RUN apk --no-cache add ca-certificates tzdata yara && \
 
 WORKDIR /app
 COPY --from=builder /out/s3scanner .
+COPY --from=builder /out/s3nitor-dashboard .
 COPY --from=builder /app/rules ./rules
 
 RUN chown -R s3nitor:s3nitor /app
-USER s3nitor
 
-# Serves /metrics and /healthz.
-EXPOSE 8080
+# Numeric, not the name. With `runAsNonRoot: true` a kubelet has to prove the
+# user is not root before starting the container, and it cannot resolve a name
+# against the image's /etc/passwd — it fails with "image has non-numeric user"
+# and never starts.
+USER 1001:1001
+
+# 8080 scanner metrics, 8081 dashboard.
+EXPOSE 8080 8081
 
 ENTRYPOINT ["./s3scanner"]
