@@ -1,0 +1,42 @@
+# Exposes the MinIO Console at minio.th, alongside the notification patch that
+# lives next to it in minio-notify-patch.yaml.
+#
+# Port 9001, not 9000. The Service carries both: 9000 is the S3 API, 9001 is the
+# browser console (`server /data --console-address :9001`). Pointing this at 9000
+# yields a page of XML errors rather than a login screen.
+#
+# Follows the cluster's convention — traefik, plain HTTP, single-label internal
+# host resolving to the ingress load balancer at 10.12.231.211 — and needs the
+# matching A record in the coredns-authoritative ConfigMap, zone db.th.
+#
+# Worth being deliberate about what this exposes. Unlike the s3nitor dashboard,
+# the console has its own login, so it is not open to anyone who can route to
+# it. But it is full storage administration: buckets can be emptied, policies
+# rewritten, access keys minted. Elasticsearch keeps its snapshot repository in
+# this same MinIO (bucket elk-snapshots), so the blast radius reaches past
+# s3nitor. The root password in the minio-creds secret is the only thing
+# standing in front of all of it.
+#
+# There is no TLS here because the cluster has no ClusterIssuer and every
+# neighbouring ingress is plain HTTP — which means the console login travels the
+# internal network in the clear. That is the same posture as everything beside
+# it, but it is a password rather than a read-only view, so it is worth knowing.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: minio-console
+  labels:
+    app: minio
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: minio.th
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: minio
+                port:
+                  number: 9001
