@@ -12,6 +12,8 @@
 #   ./test/e2e/wire-events.sh check   # show the rule and the topic offset
 #   ./test/e2e/wire-events.sh tail    # dump events as they arrive
 #   ./test/e2e/wire-events.sh put     # upload a probe file and watch it land
+#   ./test/e2e/wire-events.sh resume  # stop the scanner, upload, restart, prove
+#                                     # nothing was lost while it was down
 set -euo pipefail
 trap 'echo "FAILED at line $LINENO" >&2' ERR
 
@@ -147,5 +149,79 @@ health)
   if [ "$fail" -eq 0 ]; then echo "Rantai utuh."; else echo "Ada mata rantai putus di atas." >&2; exit 1; fi
   ;;
 
-*) echo "usage: $0 {add|health|check|tail|put}" >&2; exit 2 ;;
+resume)
+  # Proves the property that made Kafka worth deploying instead of Redis: an
+  # event published while the consumer is down is still there when it comes
+  # back. With a Redis list, BRPOP is destructive and the same test loses the
+  # event — that was measured in phase 0, not assumed.
+  #
+  # What is actually being checked is the consumer group's committed offset. A
+  # scanner that restarted and simply re-listed the bucket would also end up
+  # with the documents, and would prove nothing about delivery.
+  n=${N:-3}
+  espass=$(k get secret elk-th-new-es-elastic-user -o jsonpath='{.data.elastic}' | base64 -d)
+  esq() { k exec elk-th-new-es-data-0 -c elasticsearch -- \
+          curl -s -u "elastic:$espass" "http://localhost:9200/s3nitor-findings/_count?q=bucket:$BUCKET" \
+          2>/dev/null | sed -n 's/.*"count":\([0-9]*\).*/\1/p'; }
+  lag() { kafka kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+          --describe --group s3nitor 2>/dev/null | awk '$2=="'"$TOPIC"'" {print $6; exit}'; }
+
+  docs0=$(esq); echo "dokumen di ELK sebelum: ${docs0:-0}"
+
+  echo
+  echo "--- 1. matikan scanner ---"
+  k scale deploy/s3nitor-event --replicas=0
+  k wait --for=delete pod -l app=s3nitor-event --timeout=90s 2>/dev/null || true
+  k get pod -l app=s3nitor-event 2>&1 | tail -1
+
+  echo
+  echo "--- 2. upload $n file selagi mati ---"
+  user=$(k get secret minio-creds -o jsonpath='{.data.MINIO_ROOT_USER}' | base64 -d)
+  pass=$(k get secret minio-creds -o jsonpath='{.data.MINIO_ROOT_PASSWORD}' | base64 -d)
+  stamp=$(date +%s)
+  k run "mcput-$RANDOM" --rm -i --restart=Never --image=minio/mc:latest \
+    --env="MC_HOST_m=http://${user}:${pass}@minio.${NS}.svc:9000" \
+    --command -- sh -c "for i in \$(seq 1 $n); do
+        echo \"down-$stamp-\$i\" > /tmp/down-$stamp-\$i.txt
+        mc cp -q /tmp/down-$stamp-\$i.txt m/$BUCKET/down-$stamp-\$i.txt
+      done" >/dev/null 2>&1
+  sleep 3
+
+  echo
+  echo "--- 3. event tertahan di broker, bukan hilang ---"
+  echo "  lag consumer group: $(lag)   <-- bukan 0, dan tidak ada yang mengonsumsinya"
+  kafka kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic "$TOPIC" | sed 's/^/  offset: /'
+
+  echo
+  echo "--- 4. hidupkan lagi ---"
+  k scale deploy/s3nitor-event --replicas=1
+  k rollout status deploy/s3nitor-event --timeout=180s | tail -1
+
+  echo
+  echo "--- 5. tunggu dokumennya benar-benar terbit ---"
+  # Waits on the document count, not on the consumer lag. Lag reaching zero only
+  # says the messages were read; the findings are still in a publish batch that
+  # flushes on PUBLISH_FLUSH_INTERVAL. An earlier version of this test asserted
+  # the moment lag hit zero and reported a failure while the scan had in fact
+  # succeeded — it was measuring a proxy for the thing it claimed to check.
+  want=$((docs0 + n * 2))   # one document per (file x scanner), ioc + yara
+  docs1=$docs0
+  for i in $(seq 1 30); do
+    docs1=$(esq)
+    echo "  lag=$(lag)  dokumen=${docs1:-0}/$want"
+    [ "${docs1:-0}" -ge "$want" ] && break
+    sleep 3
+  done
+
+  echo
+  echo "dokumen di ELK sesudah: ${docs1:-0} (sebelum ${docs0:-0})"
+  if [ "${docs1:-0}" -gt "${docs0:-0}" ]; then
+    echo "OK: $n upload saat mati tetap terscan setelah hidup — tidak ada event hilang"
+  else
+    echo "GAGAL: tidak ada dokumen baru; event hilang saat downtime" >&2
+    exit 1
+  fi
+  ;;
+
+*) echo "usage: $0 {add|health|check|tail|put|resume}" >&2; exit 2 ;;
 esac
