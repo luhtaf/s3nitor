@@ -91,6 +91,7 @@ func (v *virustotal) parse(body []byte) (scanner.Result, error) {
 // NewVirusTotal builds the VirusTotal scanner.
 func NewVirusTotal(cfg *config.Config, gdb *gorm.DB) scanner.Scanner {
 	return &lookup{
+		SyncScanner: scanner.SyncScanner{ScanTimeout: cfg.ScanTimeout},
 		p: &virustotal{
 			apiKey:          cfg.VTAPIKey,
 			mediumThreshold: cfg.VTSeverityMedium,

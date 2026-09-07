@@ -37,6 +37,12 @@ type provider interface {
 
 // lookup is the shared scanner around a provider.
 type lookup struct {
+	// Sync despite being slow. Slow is not the same as asynchronous: an intel
+	// lookup blocks on somebody else's HTTP endpoint and answers from that same
+	// call, so it waits rather than handing out a token. What protects the
+	// pipeline from its latency is the lane's spill policy, not its mode.
+	scanner.SyncScanner
+
 	p        provider
 	gdb      *gorm.DB
 	client   *http.Client

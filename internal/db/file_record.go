@@ -82,3 +82,18 @@ func SeenFileIDs(db *gorm.DB, ids []string) (map[string]bool, error) {
 	}
 	return seen, nil
 }
+
+// GetFileRecord loads one record by id.
+//
+// The async worker needs it on the sweeper path: a ScanTask holds the token and
+// the scanner but not the object's identity, and a published document needs the
+// bucket, key and hashes. The Kafka path carries them in the message instead, so
+// the common case never touches this — it is the fallback for a continuation
+// whose message was lost.
+func GetFileRecord(db *gorm.DB, fileID string) (*FileRecord, error) {
+	var rec FileRecord
+	if err := db.Where("file_id = ?", fileID).First(&rec).Error; err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}

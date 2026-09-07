@@ -56,10 +56,11 @@ func (o *otx) parse(body []byte) (scanner.Result, error) {
 // than failing every object.
 func NewOTX(cfg *config.Config, gdb *gorm.DB) scanner.Scanner {
 	return &lookup{
-		p:        &otx{apiKey: cfg.OTXAPIKey},
-		gdb:      gdb,
-		client:   &http.Client{Timeout: 15 * time.Second},
-		enabled:  cfg.EnableOTX && cfg.OTXAPIKey != "",
-		cacheTTL: cfg.IntelCacheTTL,
+		SyncScanner: scanner.SyncScanner{ScanTimeout: cfg.ScanTimeout},
+		p:           &otx{apiKey: cfg.OTXAPIKey},
+		gdb:         gdb,
+		client:      &http.Client{Timeout: 15 * time.Second},
+		enabled:     cfg.EnableOTX && cfg.OTXAPIKey != "",
+		cacheTTL:    cfg.IntelCacheTTL,
 	}
 }

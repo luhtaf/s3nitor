@@ -108,6 +108,31 @@ YARA needs the bytes; IOC and the intel lookups need only hashes.
 instead — they need the cache, and wiring them inside `scanner` would make
 `scanner` import `intel` while `intel` imports `scanner`.
 
+### Sync versus async
+
+A separate axis from the lane policy below. The policy answers "the queue is
+full, now what"; the mode answers "does the verdict come back from the call we
+just made".
+
+`ModeSync` returns a `Result` within `Timeout()`. `ModeAsync` starts work
+elsewhere and returns a `*PendingError` carrying a resume token. Both use the
+same error: an async scanner returns it immediately, a sync one only when its
+deadline passes with work already in flight.
+
+**A timeout is a handoff, not a loss.** Submitting to a sandbox has already paid
+for the upload; abandoning it on a deadline would throw that away and re-send
+the same bytes on retry. Returning the token instead keeps the external analysis
+running and lets `s3nitor-async` resume it by polling.
+
+`Resumable.Poll(ctx, token)` deliberately takes no `ScanInput`: the object went
+to the sandbox at submit time, so resuming needs the token, never the bytes.
+That is why the async worker holds no S3 credentials and why the payload is
+released the moment a scan is handed off.
+
+**Nothing is published for a pending scan.** A placeholder document would mean
+every consumer had to know that `match:false` sometimes means "not answered
+yet", and the one that forgets reads an unfinished detonation as a clean file.
+
 ### Block versus spill
 
 A full queue is handled by **how long the wait is**, not how slow the scanner is.
@@ -131,6 +156,28 @@ the batch. Reversed, a crash in between loses those findings permanently — the
 record claims the object was handled, so it is never queued again. That is safe
 only because `Finding.DocID()` is deterministic, which turns a replay into an
 overwrite.
+
+### Async collection (`internal/async`, `cmd/s3nitor-async`)
+
+A second topic (`ASYNC_TOPIC`) and a second binary. Two topics because the
+messages differ in lifetime: an event is consumed in milliseconds, a
+continuation may be re-queued for hours, and a Kafka partition delivers in
+order — the slow message does not step aside.
+
+The worker has two ways in, and they are not redundant. Kafka makes collection
+prompt; the sweeper over `scan_tasks` makes it certain, because a message can be
+lost to a broker outage or a retention window that expires mid-analysis. **The
+ledger is the source of truth and Kafka is an accelerator** — which is why
+`handoff` writes the row before publishing, and why lister mode can enable a
+sandbox without acquiring a broker dependency.
+
+`EnqueueContinuation` does not increment `Attempts`: polling a running analysis
+is not a failed attempt, and counting it as one lets `PENDING_MAX_ATTEMPTS`
+abandon a sandbox job purely for being slow.
+
+`ASYNC_MAX_AGE` abandons an analysis that never finishes, publishing a document
+that says so. Left polling, the task stays pending and publishes nothing — and
+nothing is indistinguishable from clean.
 
 ### Persistence (`internal/db`)
 
@@ -185,7 +232,7 @@ bucket in the hostname, which cannot resolve against a custom endpoint.
 ## Verifying changes
 
 ```bash
-go test -race ./...        # 40 tests, no infrastructure needed
+go test -race ./...        # 54 tests, no infrastructure needed
 ./test/e2e/local.sh        # real MinIO in Docker, no cluster
 ```
 

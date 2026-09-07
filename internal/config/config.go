@@ -103,6 +103,60 @@ type Config struct {
 
 	// PendingRetryBase is the first backoff step; each attempt doubles it.
 	PendingRetryBase time.Duration
+	// Sandbox detonation. Off by default: it sends the object to a third-party
+	// analysis service, which for a bucket of customer data is a decision
+	// somebody has to make deliberately rather than inherit from a default.
+	EnableSandbox bool
+	// SandboxKind selects the API dialect: cuckoo or cape. Named rather than
+	// sniffed — the two answer similar-looking JSON on different paths, so a
+	// wrong guess fails in ways that look like a broken deployment.
+	SandboxKind        string
+	SandboxURL         string
+	SandboxAPIKey      string
+	SandboxHTTPTimeout time.Duration
+	// SandboxMaxObjectSize skips objects too large to detonate usefully. The
+	// skip is published as a document rather than dropped, because a missing
+	// document reads downstream as "clean".
+	SandboxMaxObjectSize int64
+	// Score thresholds on the backend's own 0-10 scale. The raw score travels
+	// in the document's detail, so a consumer that disagrees can apply its own
+	// without re-running the analysis.
+	SandboxSeverityMedium   float64
+	SandboxSeverityHigh     float64
+	SandboxSeverityCritical float64
+
+	// ScanTimeout bounds one synchronous Scan call.
+	//
+	// Without it a single object can hold a CPU lane indefinitely: YARA shells
+	// out, and a rule with pathological backtracking against a large file runs
+	// for as long as it likes. The deadline is per call, not per object — a
+	// scanner that hits it and can be resumed hands its token on instead of
+	// discarding the work it already paid for.
+	ScanTimeout time.Duration
+
+	// AsyncTopic carries resume tokens for scans that outlive the call that
+	// started them, kept separate from the bucket-notification topic.
+	//
+	// Two topics rather than one because the messages differ in kind and in
+	// lifetime: an event says "this object appeared" and is consumed in
+	// milliseconds, while a continuation says "this analysis is still running
+	// elsewhere" and may be re-queued for hours. Sharing a topic would put a
+	// sandbox that polls for an hour in front of the next upload.
+	AsyncTopic string
+	// AsyncGroupID is the async worker's consumer group, separate from the
+	// scanner's so the two never steal each other's messages.
+	AsyncGroupID string
+	// AsyncPollInterval is how long a continuation waits before being polled
+	// again after the sandbox says "not yet".
+	AsyncPollInterval time.Duration
+	// AsyncSweepInterval is how often the worker looks in the ledger for
+	// continuations the broker never delivered.
+	AsyncSweepInterval time.Duration
+	// AsyncMaxAge abandons a continuation whose analysis never finishes, so a
+	// sandbox that silently drops a submission does not leave the task pending
+	// forever with no document ever published.
+	AsyncMaxAge time.Duration
+
 	// PendingMaxAttempts stops a task that keeps failing from being retried
 	// forever. Past it the task is marked failed and the failure is published,
 	// so it is visible rather than silently absent.
@@ -197,6 +251,25 @@ func Load() *Config {
 			"otx":        float64(getInt("OTX_RATE_PER_MIN", 600)),
 			"virustotal": float64(getInt("VT_RATE_PER_MIN", 4)), // free tier
 		},
+		EnableSandbox:      os.Getenv("ENABLE_SANDBOX") == "true",
+		SandboxKind:        getOrDefault("SANDBOX_KIND", "cape"),
+		SandboxURL:         os.Getenv("SANDBOX_URL"),
+		SandboxAPIKey:      os.Getenv("SANDBOX_API_KEY"),
+		SandboxHTTPTimeout: getDuration("SANDBOX_HTTP_TIMEOUT", 2*time.Minute),
+		// 100MB: past that the upload itself starts costing more than the
+		// analysis is worth, and most sandboxes refuse it anyway.
+		SandboxMaxObjectSize:    getBytes("SANDBOX_MAX_OBJECT_SIZE", 100*MB),
+		SandboxSeverityMedium:   getFloat("SANDBOX_SEVERITY_MEDIUM", 3),
+		SandboxSeverityHigh:     getFloat("SANDBOX_SEVERITY_HIGH", 6),
+		SandboxSeverityCritical: getFloat("SANDBOX_SEVERITY_CRITICAL", 8),
+
+		ScanTimeout:        getDuration("SCAN_TIMEOUT", 2*time.Minute),
+		AsyncTopic:         getOrDefault("ASYNC_TOPIC", "s3nitor-scan-async"),
+		AsyncGroupID:       getOrDefault("ASYNC_GROUP_ID", "s3nitor-async"),
+		AsyncPollInterval:  getDuration("ASYNC_POLL_INTERVAL", 30*time.Second),
+		AsyncSweepInterval: getDuration("ASYNC_SWEEP_INTERVAL", time.Minute),
+		AsyncMaxAge:        getDuration("ASYNC_MAX_AGE", 6*time.Hour),
+
 		PendingRetryBase:   getDuration("PENDING_RETRY_BASE", 30*time.Second),
 		PendingMaxAttempts: getInt("PENDING_MAX_ATTEMPTS", 5),
 
@@ -338,4 +411,21 @@ func ParseBytes(raw string) (int64, error) {
 		return 0, fmt.Errorf("size cannot be negative: %q", raw)
 	}
 	return int64(value * float64(mult)), nil
+}
+
+// getFloat reads a fractional setting, keeping the default on a bad value.
+//
+// Sandbox scores are fractional (Cuckoo and CAPE both report things like 6.4),
+// so rounding them to an int would move every threshold by up to a whole point.
+func getFloat(key string, def float64) float64 {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		log.Printf("config: %s=%q is not a number, using %g", key, raw, def)
+		return def
+	}
+	return v
 }

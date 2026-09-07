@@ -38,6 +38,22 @@ type ScanTask struct {
 	NextAttemptAt time.Time `gorm:"index"`
 	LastError     string
 
+	// ResumeToken identifies work still running outside this process — a Cuckoo
+	// task id, a CAPE analysis id. Its meaning belongs to the scanner that
+	// issued it; nothing here interprets it.
+	//
+	// Its presence changes what a retry means. Without a token, retrying a task
+	// re-runs the scan from the object, which for a sandbox means uploading the
+	// bytes again. With one, retrying is a poll: the analysis is already
+	// underway and only its verdict is missing. That is why a timeout can be a
+	// handoff rather than a loss.
+	ResumeToken string `gorm:"size:128"`
+	// SubmittedAt is when the external work started, used to abandon an
+	// analysis that never finishes. A sandbox that silently drops a submission
+	// would otherwise leave this row pending forever and publish no document at
+	// all — which reads downstream as "clean", not as "never answered".
+	SubmittedAt time.Time
+
 	// A lease rather than a plain running flag: if the process dies, the row
 	// would otherwise stay "running" forever. Reclaiming expired leases is safe
 	// with several replicas, whereas resetting every running row at startup
@@ -64,6 +80,50 @@ func MarkDone(db *gorm.DB, fileID, scanner string) error {
 			"finished_at":      time.Now().UTC(),
 			"leased_by":        "",
 			"lease_expires_at": time.Time{},
+		}).Error
+}
+
+// EnqueueContinuation parks a task whose work is already running elsewhere.
+//
+// Distinct from EnqueuePending, which parks work that has not started: this one
+// records the token and the submission time, and schedules the first poll
+// rather than a retry. Attempts is deliberately not incremented — polling a
+// running analysis is not a failed attempt, and counting it that way would let
+// PENDING_MAX_ATTEMPTS abandon a sandbox job purely for being slow.
+func EnqueueContinuation(db *gorm.DB, fileID, scannerName, rulesVersion, token string, pollIn time.Duration) error {
+	now := time.Now().UTC()
+	return db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "file_id"}, {Name: "scanner"}},
+		DoUpdates: clause.Assignments(map[string]any{
+			"status":          StatusPending,
+			"rules_version":   rulesVersion,
+			"resume_token":    token,
+			"submitted_at":    now,
+			"next_attempt_at": now.Add(pollIn),
+			"updated_at":      now,
+		}),
+	}).Create(&ScanTask{
+		FileID:        fileID,
+		Scanner:       scannerName,
+		Status:        StatusPending,
+		RulesVersion:  rulesVersion,
+		ResumeToken:   token,
+		SubmittedAt:   now,
+		NextAttemptAt: now.Add(pollIn),
+	}).Error
+}
+
+// RescheduleContinuation moves the next poll out without touching the token or
+// the attempt count.
+func RescheduleContinuation(db *gorm.DB, fileID, scannerName string, pollIn time.Duration) error {
+	now := time.Now().UTC()
+	return db.Model(&ScanTask{}).
+		Where("file_id = ? AND scanner = ?", fileID, scannerName).
+		Updates(map[string]any{
+			"status":          StatusPending,
+			"leased_by":       "",
+			"next_attempt_at": now.Add(pollIn),
+			"updated_at":      now,
 		}).Error
 }
 

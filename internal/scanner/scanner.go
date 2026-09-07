@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"errors"
 	"log"
 
 	"github.com/luhtaf/s3nitor/internal/config"
@@ -37,11 +38,39 @@ func NewEngine(cfg *config.Config) *Engine {
 // once the pod was gone — and for a security scanner, "this check did not run"
 // has to be as visible as "this check found nothing".
 func ScanOne(ctx context.Context, s Scanner, in *ScanInput) *Finding {
-	res, err := s.Scan(ctx, in)
+	res, err := RunScan(ctx, s, in)
 	if err != nil {
 		log.Printf("[%s] %s: %v", s.Name(), in.Key, err)
 	}
 	return NewFinding(in, s, res, err)
+}
+
+// RunScan calls a scanner under its own deadline.
+//
+// The deadline is derived from the caller's context rather than replacing it,
+// so cancelling the run still cancels the scan; the timeout only ever makes the
+// bound tighter.
+//
+// A *PendingError comes back unwrapped on purpose. Wrapping it in "deadline
+// exceeded" would be accurate and useless: the caller has to tell "this failed"
+// from "this is still running elsewhere, here is how to find it", and only the
+// second one carries a token worth keeping.
+func RunScan(ctx context.Context, s Scanner, in *ScanInput) (Result, error) {
+	if d := s.Timeout(); d > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d)
+		defer cancel()
+	}
+	return s.Scan(ctx, in)
+}
+
+// AsPending reports whether an error is a handoff rather than a failure.
+func AsPending(err error) (*PendingError, bool) {
+	var pe *PendingError
+	if errors.As(err, &pe) {
+		return pe, true
+	}
+	return nil, false
 }
 
 // NewEngineWith builds an engine from an explicit scanner set.

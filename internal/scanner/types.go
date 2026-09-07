@@ -53,6 +53,67 @@ type Result struct {
 	Detail   map[string]any `json:"detail,omitempty"`
 }
 
+// Mode says how a scanner finishes.
+//
+// This is a different axis from the lane's full-queue policy, which answers
+// "what do we do when this scanner's queue is full". Mode answers "does the
+// verdict arrive from the call we just made". A scanner can be slow and still
+// sync (it blocks, we wait); a scanner can be fast and still async (it hands
+// the work to something else that answers later).
+type Mode int
+
+const (
+	// ModeSync returns the verdict from Scan, within Timeout.
+	ModeSync Mode = iota
+	// ModeAsync starts work elsewhere and returns a resume token immediately.
+	// Nothing waits: the verdict is collected later by the async worker.
+	ModeAsync
+)
+
+func (m Mode) String() string {
+	if m == ModeAsync {
+		return "async"
+	}
+	return "sync"
+}
+
+// PendingError reports that a scanner started work it did not finish, and
+// carries the token needed to pick it up again.
+//
+// This is what makes a timeout non-destructive. A sandbox submission has
+// already cost the upload of the object; abandoning it on a deadline would
+// throw that away and re-submit the same bytes on retry. Returning the token
+// instead turns the timeout into a handoff — the external job keeps running,
+// and the async worker resumes it by polling that id.
+//
+// Both modes use it: an async scanner returns it immediately, a sync scanner
+// returns it only when its deadline passes with no verdict.
+type PendingError struct {
+	// Token identifies the work to the scanner that started it. Its meaning is
+	// private to that scanner — a Cuckoo task id, a CAPE analysis id — and the
+	// pipeline only stores and returns it.
+	Token string
+	// RetryAfter hints how long to wait before polling. Zero uses the default
+	// backoff.
+	RetryAfter time.Duration
+}
+
+func (e *PendingError) Error() string {
+	return "scan pending, resume token " + e.Token
+}
+
+// Resumable is implemented by scanners whose work can outlive the call that
+// started it. Poll is what the async worker calls with a token from
+// PendingError; done reports whether the verdict is final.
+//
+// Note what Poll does not take: a ScanInput. Resuming needs the token, not the
+// bytes — the object was already handed to the sandbox at submit time. That is
+// why the async worker needs no S3 credentials and no re-download, and why
+// releasing the payload at handoff is safe.
+type Resumable interface {
+	Poll(ctx context.Context, token string) (result Result, done bool, err error)
+}
+
 // Scanner examines one object and returns its own verdict.
 //
 // Implementations must be safe to call concurrently for different inputs: the
@@ -71,8 +132,35 @@ type Scanner interface {
 	// forcing every other scanner to run again.
 	RulesVersion() string
 
+	// Mode reports whether Scan returns the verdict or a resume token.
+	Mode() Mode
+
+	// Timeout bounds one Scan call. Zero means unbounded, which is only
+	// reasonable for scanners whose work is local and finite.
+	//
+	// A bound matters even for local scanners: YARA shells out, and a rule with
+	// pathological backtracking against a large file can run far longer than
+	// the object is worth. Without a deadline that one object holds a CPU lane
+	// for as long as it likes.
+	Timeout() time.Duration
+
+	// Scan examines the object.
+	//
+	// Returning a *PendingError is not a failure: it means the work was started
+	// and its verdict will be collected later.
 	Scan(ctx context.Context, in *ScanInput) (Result, error)
 }
+
+// SyncScanner supplies the Mode and Timeout defaults, so an existing scanner
+// becomes conformant by embedding it rather than by growing two methods that
+// say nothing.
+type SyncScanner struct {
+	// ScanTimeout is exported so a constructor can set it from config.
+	ScanTimeout time.Duration
+}
+
+func (SyncScanner) Mode() Mode               { return ModeSync }
+func (s SyncScanner) Timeout() time.Duration { return s.ScanTimeout }
 
 // Finding is one scanner's verdict on one object — the unit that gets published.
 //
@@ -109,6 +197,17 @@ type Finding struct {
 
 // NewFinding builds a published verdict from an input and a scanner's result.
 func NewFinding(in *ScanInput, s Scanner, res Result, scanErr error) *Finding {
+	return NewFindingFor(in, s.Name(), s.RulesVersion(), res, scanErr)
+}
+
+// NewFindingFor builds the same document from a scanner's name and ruleset
+// rather than the scanner itself.
+//
+// The async worker needs this: it publishes verdicts for scans it did not run,
+// and may not even have the scanner registered. Routing both paths through one
+// constructor is what keeps the resumed document byte-identical to the inline
+// one, and therefore keeps DocID stable across them.
+func NewFindingFor(in *ScanInput, name, rulesVersion string, res Result, scanErr error) *Finding {
 	f := &Finding{
 		FileID:       in.FileID,
 		Bucket:       in.Bucket,
@@ -116,8 +215,8 @@ func NewFinding(in *ScanInput, s Scanner, res Result, scanErr error) *Finding {
 		Version:      in.Version,
 		Size:         in.Size,
 		Hashes:       in.Hashes,
-		Scanner:      s.Name(),
-		RulesVersion: s.RulesVersion(),
+		Scanner:      name,
+		RulesVersion: rulesVersion,
 		Match:        res.Match,
 		Severity:     res.Severity,
 		Detail:       res.Detail,

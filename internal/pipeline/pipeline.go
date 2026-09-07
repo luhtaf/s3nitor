@@ -13,6 +13,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"github.com/luhtaf/s3nitor/internal/async"
 	"github.com/luhtaf/s3nitor/internal/config"
 	"github.com/luhtaf/s3nitor/internal/db"
 	"github.com/luhtaf/s3nitor/internal/hashing"
@@ -71,6 +72,11 @@ type job struct {
 // The channels are bounded deliberately: a full channel is what makes a slow
 // stage push back on a fast one.
 type Pipeline struct {
+	// async hands continuations to a collector. Defaults to Discard, so a
+	// pipeline with no broker still works — the ledger carries the task and the
+	// worker's sweeper finds it, just less promptly.
+	async async.Publisher
+
 	cfg     *config.Config
 	fetcher ObjectOpener
 	engine  *scanner.Engine
@@ -118,7 +124,8 @@ func New(
 	}
 
 	p := &Pipeline{
-		cfg: cfg, fetcher: fetcher, engine: engine, rep: rep, gdb: gdb, m: m,
+		async: async.Discard{},
+		cfg:   cfg, fetcher: fetcher, engine: engine, rep: rep, gdb: gdb, m: m,
 		workDir:     workDir,
 		byteLimiter: NewByteLimiter("bytes", cfg.FetchByteBudget),
 		connLimiter: NewFixedLimiter("conns", cfg.FetchMaxConns),
@@ -648,6 +655,37 @@ func (p *Pipeline) runDispatch(ctx context.Context, in <-chan *payload, findings
 }
 
 // spill parks a task in the pending store for a later run.
+// handoff parks a scan that is running elsewhere.
+//
+// The sibling of spill, and the distinction matters: spill parks work that has
+// not started, so resuming it re-runs the scan from the object. handoff parks
+// work already underway, so resuming it is a poll. Counting a poll as a retry
+// attempt would let PENDING_MAX_ATTEMPTS abandon a sandbox job for the sole
+// offence of being slow, which is the one thing sandboxes reliably are.
+//
+// The ledger write comes first and the publish second, on purpose. If the
+// broker is down, the row still holds the token and the worker's sweeper finds
+// it; if the order were reversed, a crash in between would leave a message
+// pointing at a task nothing recorded.
+func (p *Pipeline) handoff(ctx context.Context, l *lane, t *task, pe *scanner.PendingError) {
+	in := t.payload.in
+	c := async.FromInput(in, l.scanner, pe, p.cfg.AsyncPollInterval)
+
+	if err := db.EnqueueContinuation(p.gdb, in.FileID, c.Scanner, c.RulesVersion,
+		c.Token, c.PollAfter.Sub(c.SubmittedAt)); err != nil {
+		log.Printf("handoff %s/%s: ledger: %v", in.Key, c.Scanner, err)
+	}
+	if err := p.async.Publish(ctx, c); err != nil {
+		// Not fatal: the ledger already has it, so this only costs promptness.
+		log.Printf("handoff %s/%s: publish: %v", in.Key, c.Scanner, err)
+	}
+
+	p.spilled.Add(1)
+	p.m.ObjectsSkipped.WithLabelValues("async_" + c.Scanner).Inc()
+	log.Printf("handoff %s/%s: token %s, poll after %s",
+		in.Key, c.Scanner, c.Token, c.PollAfter.Format(time.RFC3339))
+}
+
 func (p *Pipeline) spill(ctx context.Context, t *task, findings chan<- *scanner.Finding) {
 	in := t.payload.in
 	if err := db.EnqueuePending(p.gdb, in.FileID, t.scanner.Name(), t.scanner.RulesVersion(), p.cfg.PendingRetryBase); err != nil {
@@ -693,8 +731,22 @@ func (p *Pipeline) runLane(ctx context.Context, l *lane, findings chan<- *scanne
 				return
 			}
 
-			finding := scanner.ScanOne(ctx, l.scanner, t.payload.in)
+			res, scanErr := scanner.RunScan(ctx, l.scanner, t.payload.in)
 			release(Outcome{Latency: time.Since(started)})
+
+			// A pending result is a handoff, not a verdict: the work is running
+			// outside this process and its token is the way back to it. Nothing
+			// is published here — publishing "no finding yet" would be
+			// indistinguishable downstream from "scanned, clean".
+			if pe, ok := scanner.AsPending(scanErr); ok {
+				p.handoff(ctx, l, t, pe)
+				return
+			}
+
+			finding := scanner.NewFinding(t.payload.in, l.scanner, res, scanErr)
+			if scanErr != nil {
+				log.Printf("[%s] %s: %v", l.scanner.Name(), t.payload.in.Key, scanErr)
+			}
 
 			p.m.ObserveStage(stageAnalyze, started, nil)
 			p.m.Findings.WithLabelValues(finding.Scanner, string(finding.Severity)).Inc()
@@ -893,4 +945,15 @@ func (p *Pipeline) sampleQueueDepth(depths map[string]func() int) func() {
 		}
 	}()
 	return func() { close(done) }
+}
+
+// SetAsyncPublisher replaces the handoff destination.
+//
+// A setter rather than another constructor parameter: handoff is optional and
+// every existing caller — including every test — would otherwise have to name a
+// dependency it does not use.
+func (p *Pipeline) SetAsyncPublisher(pub async.Publisher) {
+	if pub != nil {
+		p.async = pub
+	}
 }

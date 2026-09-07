@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/luhtaf/s3nitor/internal/async"
 	"github.com/luhtaf/s3nitor/internal/config"
 	"github.com/luhtaf/s3nitor/internal/db"
 	"github.com/luhtaf/s3nitor/internal/intel"
@@ -16,6 +17,7 @@ import (
 	"github.com/luhtaf/s3nitor/internal/pipeline"
 	"github.com/luhtaf/s3nitor/internal/reporter"
 	"github.com/luhtaf/s3nitor/internal/s3fetcher"
+	"github.com/luhtaf/s3nitor/internal/sandbox"
 	"github.com/luhtaf/s3nitor/internal/scanner"
 	"github.com/luhtaf/s3nitor/internal/source"
 	"github.com/luhtaf/s3nitor/internal/source/decoder"
@@ -98,7 +100,23 @@ func run() error {
 	scanners := scanner.NewEngine(cfg).Scanners()
 	scanners = append(scanners, intel.NewOTX(cfg, gdb), intel.NewVirusTotal(cfg, gdb))
 
+	// The sandbox is the one scanner that does not answer from the call that
+	// starts it: it submits and hands back a token, and s3nitor-async collects
+	// the verdict. Registering it here is what makes objects get submitted;
+	// without the async worker running, they are submitted and never collected.
+	scanners = append(scanners, sandbox.New(cfg))
+
 	p := pipeline.New(cfg, fetcher, scanner.NewEngineWith(scanners...), rep, gdb, m, workDir)
+
+	// Kafka only makes the handoff prompt. With no broker the ledger still
+	// records every continuation and the worker's sweeper finds it, so lister
+	// mode does not acquire a broker dependency by enabling a sandbox.
+	if cfg.EventTransport == "kafka" && len(cfg.KafkaBrokers) > 0 {
+		pub := async.NewKafkaPublisher(cfg.KafkaBrokers, cfg.AsyncTopic)
+		defer pub.Close()
+		p.SetAsyncPublisher(pub)
+		log.Printf("handoff: kafka topic %q", cfg.AsyncTopic)
+	}
 	summary, err := p.Run(ctx, refs)
 	if err != nil {
 		return err

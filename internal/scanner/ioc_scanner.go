@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/luhtaf/s3nitor/internal/config"
 )
@@ -20,6 +21,8 @@ import (
 // It reads only ScanInput.Hashes, so it never touches the downloaded file and a
 // retry never has to fetch the object again.
 type IOCScanner struct {
+	SyncScanner
+
 	md5Set    map[string]bool
 	sha1Set   map[string]bool
 	sha256Set map[string]bool
@@ -32,11 +35,12 @@ type IOCScanner struct {
 // with a log line rather than treated as fatal.
 func NewIOCScanner(cfg *config.Config) *IOCScanner {
 	i := &IOCScanner{
-		md5Set:    make(map[string]bool),
-		sha1Set:   make(map[string]bool),
-		sha256Set: make(map[string]bool),
-		enabled:   cfg.EnableIOC,
-		path:      cfg.IOCPath,
+		SyncScanner: SyncScanner{ScanTimeout: 5 * time.Second},
+		md5Set:      make(map[string]bool),
+		sha1Set:     make(map[string]bool),
+		sha256Set:   make(map[string]bool),
+		enabled:     cfg.EnableIOC,
+		path:        cfg.IOCPath,
 	}
 
 	if !i.enabled {

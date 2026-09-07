@@ -20,6 +20,8 @@ import (
 // It reads the downloaded object, so NeedsPayload is true and a spilled retry
 // has to fetch the bytes again.
 type YARAScanner struct {
+	SyncScanner
+
 	enabled bool
 	path    string
 	yaraCmd string
@@ -31,9 +33,10 @@ type YARAScanner struct {
 // "this scanner is off" rather than failing every object.
 func NewYaraScanner(cfg *config.Config) *YARAScanner {
 	y := &YARAScanner{
-		enabled: cfg.EnableYara,
-		path:    "rules/yara/",
-		yaraCmd: cfg.YARACmd,
+		SyncScanner: SyncScanner{ScanTimeout: cfg.ScanTimeout},
+		enabled:     cfg.EnableYara,
+		path:        "rules/yara/",
+		yaraCmd:     cfg.YARACmd,
 	}
 	if cfg.YARAPath != "" {
 		y.path = cfg.YARAPath

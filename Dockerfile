@@ -32,6 +32,15 @@ RUN CGO_ENABLED=1 GOOS=linux go build \
       -ldflags "-s -w -X main.Version=${VERSION}" \
       -o /out/s3nitor-dashboard ./cmd/s3nitor-dashboard
 
+# The async collector, likewise. A third runtime rather than a goroutine inside
+# the scanner: it waits on somebody else's analysis and uses almost nothing,
+# while the scanner is bounded by bytes in flight and CPU. Sharing a process
+# would make the scanner's memory limit cover both, and restarting one would
+# interrupt the other.
+RUN CGO_ENABLED=1 GOOS=linux go build \
+      -trimpath -ldflags "-s -w -X main.Version=${VERSION}" \
+      -o /out/s3nitor-async ./cmd/s3nitor-async
+
 # Prove the binary can open a database before it ships. A green build is not
 # evidence of a working binary here: the cgo failure mode only appears at
 # runtime, and this is the cheapest place to catch a regression.
@@ -59,6 +68,7 @@ RUN apk --no-cache add ca-certificates tzdata yara && \
 WORKDIR /app
 COPY --from=builder /out/s3scanner .
 COPY --from=builder /out/s3nitor-dashboard .
+COPY --from=builder /out/s3nitor-async .
 COPY --from=builder /app/rules ./rules
 
 RUN chown -R s3nitor:s3nitor /app

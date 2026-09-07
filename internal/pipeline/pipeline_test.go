@@ -81,6 +81,8 @@ func (r *trackedReader) Close() error {
 // fakeScanner stands in for a real scanner so a test can control exactly what
 // runs, whether it touches the payload, and how long it takes.
 type fakeScanner struct {
+	scanner.SyncScanner
+
 	name        string
 	needsFile   bool
 	delay       time.Duration
@@ -655,5 +657,120 @@ func TestOpenEndedSourceStillScansPartialDedupBatch(t *testing.T) {
 	}
 	if got := sc.missingFile.Load(); got != 0 {
 		t.Errorf("payload was missing for %d scans", got)
+	}
+}
+
+// asyncScanner stands in for a sandbox: it starts work elsewhere and hands back
+// a token instead of a verdict.
+type asyncScanner struct {
+	name  string
+	token string
+	calls atomic.Int64
+}
+
+func (a *asyncScanner) Name() string           { return a.name }
+func (a *asyncScanner) Enabled() bool          { return true }
+func (a *asyncScanner) NeedsPayload() bool     { return true }
+func (a *asyncScanner) RulesVersion() string   { return "v1" }
+func (a *asyncScanner) Mode() scanner.Mode     { return scanner.ModeAsync }
+func (a *asyncScanner) Timeout() time.Duration { return 0 }
+
+func (a *asyncScanner) Scan(context.Context, *scanner.ScanInput) (scanner.Result, error) {
+	a.calls.Add(1)
+	return scanner.Result{}, &scanner.PendingError{Token: a.token}
+}
+
+// A handed-off scan must publish nothing at all.
+//
+// The tempting alternative — emit a placeholder document saying "pending" — is
+// worse than it looks: every consumer would then have to know that match:false
+// sometimes means "not answered yet", and the one that forgets reads an
+// unfinished detonation as a clean file.
+func TestAsyncScannerPublishesNothingAndRecordsAToken(t *testing.T) {
+	cfg := testConfig()
+	cfg.AsyncPollInterval = time.Minute
+
+	sizes := map[string]int64{"k0": 64}
+	gdb := testDB(t)
+	rep := &recordingReporter{}
+	sc := &asyncScanner{name: "sandbox", token: "task-417"}
+
+	p := New(cfg, &fakeOpener{sizes: sizes}, scanner.NewEngineWith(sc), rep, gdb, metrics.New(), t.TempDir())
+	if _, err := p.Run(context.Background(),
+		stream(source.ObjectRef{Bucket: "b", Key: "k0", Version: "v", Size: 64})); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if sc.calls.Load() != 1 {
+		t.Fatalf("scanner ran %d times, want 1", sc.calls.Load())
+	}
+	if n := rep.count(); n != 0 {
+		t.Errorf("published %d documents, want 0 — a pending scan is not a verdict", n)
+	}
+
+	var tasks []db.ScanTask
+	if err := gdb.Find(&tasks).Error; err != nil {
+		t.Fatalf("reading scan_tasks: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("ledger holds %d tasks, want 1", len(tasks))
+	}
+	if tasks[0].ResumeToken != "task-417" {
+		t.Errorf("resume token = %q, want task-417 — without it the analysis is unreachable",
+			tasks[0].ResumeToken)
+	}
+	if tasks[0].Status != db.StatusPending {
+		t.Errorf("status = %q, want pending", tasks[0].Status)
+	}
+	// Polling a running analysis is not a failed attempt. Counting it as one
+	// lets PENDING_MAX_ATTEMPTS abandon a sandbox job purely for being slow.
+	if tasks[0].Attempts != 0 {
+		t.Errorf("attempts = %d, want 0", tasks[0].Attempts)
+	}
+	if tasks[0].SubmittedAt.IsZero() {
+		t.Error("submitted_at unset, so an analysis that never finishes can never be abandoned")
+	}
+}
+
+// The payload must be released at handoff, not held for the analysis.
+//
+// Holding it would let a third party set this pipeline's disk usage: the byte
+// budget is only freed when the temp file goes, so a sandbox queue of an hour
+// would stall every fetch behind it.
+func TestHandoffReleasesTheByteBudget(t *testing.T) {
+	const objects = 8
+
+	cfg := testConfig()
+	cfg.FetchByteBudget = 256 // two objects at a time, at most
+
+	sizes := map[string]int64{}
+	var objs []source.ObjectRef
+	for i := 0; i < objects; i++ {
+		key := fmt.Sprintf("k%d", i)
+		sizes[key] = 128
+		objs = append(objs, source.ObjectRef{Bucket: "b", Key: key, Version: key, Size: 128})
+	}
+
+	sc := &asyncScanner{name: "sandbox", token: "t"}
+	p := New(cfg, &fakeOpener{sizes: sizes}, scanner.NewEngineWith(sc), &recordingReporter{},
+		testDB(t), metrics.New(), t.TempDir())
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Run(context.Background(), stream(objs...))
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not finish — the budget was never released after handoff")
+	}
+
+	if got := sc.calls.Load(); got != objects {
+		t.Errorf("submitted %d objects, want %d", got, objects)
 	}
 }
