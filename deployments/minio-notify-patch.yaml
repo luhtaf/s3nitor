@@ -1,0 +1,35 @@
+# Adds a Kafka notification target to the shared MinIO in the kubeth cluster.
+#
+# Applying this restarts MinIO (strategy: Recreate, so the old pod is stopped
+# before the new one starts — there is a real gap, not a rolling handover).
+# That matters because Elasticsearch keeps its snapshot repository in this same
+# MinIO: repository `minio-repo`, bucket `elk-snapshots`, endpoint
+# minio.default.svc:9000. A snapshot running during the restart would fail.
+# Checked before applying: no snapshot in progress, and `_slm/policy` is empty,
+# so nothing is scheduled to start on its own.
+#
+# Env vars rather than `mc admin config set`: that only stages values until a
+# restart, and `mc admin service restart` wants /dev/tty, which it cannot get
+# under `kubectl exec` — it fails silently and the target never activates.
+#
+#   kubectl --context kubeth -n default patch deploy minio \
+#     --type strategic --patch-file deployments/minio-notify-patch.yaml
+#
+# Deliberately NO queue_dir here. MinIO validates that directory at startup and
+# refuses to boot if it cannot write there, so a bad value takes the shared
+# MinIO down rather than merely disabling spooling. It also cannot live under
+# /data, where top-level directories are buckets. Spooling is worth having —
+# it survives a broker outage — but it is a separate change with its own
+# verification, not a passenger on this one.
+spec:
+  template:
+    spec:
+      containers:
+        - name: minio
+          env:
+            - name: MINIO_NOTIFY_KAFKA_ENABLE_PRIMARY
+              value: "on"
+            - name: MINIO_NOTIFY_KAFKA_BROKERS_PRIMARY
+              value: "s3nitor-kafka-0.s3nitor-kafka.default.svc.cluster.local:9092"
+            - name: MINIO_NOTIFY_KAFKA_TOPIC_PRIMARY
+              value: "s3nitor-events"

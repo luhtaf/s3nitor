@@ -1,0 +1,102 @@
+# Single-node Kafka in KRaft mode, for the event-driven source.
+#
+# A StatefulSet with a volume, not a Deployment with emptyDir. Kafka's whole
+# contribution here is that an event survives a consumer crash — a broker that
+# loses its log on restart gives back exactly the durability that made Kafka
+# worth choosing over the Redis list already in this cluster.
+#
+# One replica: the workload is one scanner reading one topic, and three brokers
+# would add operational surface without adding a guarantee anything here needs.
+# Note what that costs — a broker restart is a gap in availability, though not
+# in durability, since the log is on the volume.
+#
+#   kubectl --context kubeth -n default apply -f deployments/kafka.yaml
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3nitor-kafka
+  labels: { app.kubernetes.io/name: s3nitor-kafka }
+spec:
+  clusterIP: None          # headless: the StatefulSet needs stable per-pod DNS
+  selector: { app.kubernetes.io/name: s3nitor-kafka }
+  ports:
+    - { name: kafka, port: 9092, targetPort: 9092 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: s3nitor-kafka
+  labels: { app.kubernetes.io/name: s3nitor-kafka }
+spec:
+  serviceName: s3nitor-kafka
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: s3nitor-kafka }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: s3nitor-kafka }
+    spec:
+      securityContext:
+        # The image runs as uid 1000; fsGroup makes the mounted volume writable
+        # for it without running the broker as root.
+        fsGroup: 1000
+      containers:
+        - name: kafka
+          image: apache/kafka:3.9.0
+          env:
+            - { name: KAFKA_NODE_ID, value: "1" }
+            # Combined roles: one process is both broker and controller. Correct
+            # for a single node; a real cluster separates them.
+            - { name: KAFKA_PROCESS_ROLES, value: "broker,controller" }
+            - { name: KAFKA_LISTENERS, value: "PLAINTEXT://:9092,CONTROLLER://:9093" }
+            # Advertised as the stable per-pod DNS name, not the pod IP, which
+            # changes on every restart and would leave clients pointed at
+            # nothing.
+            - { name: KAFKA_ADVERTISED_LISTENERS,
+                value: "PLAINTEXT://s3nitor-kafka-0.s3nitor-kafka.default.svc.cluster.local:9092" }
+            - { name: KAFKA_CONTROLLER_QUORUM_VOTERS, value: "1@localhost:9093" }
+            - { name: KAFKA_CONTROLLER_LISTENER_NAMES, value: "CONTROLLER" }
+            - { name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP,
+                value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT" }
+            - { name: KAFKA_INTER_BROKER_LISTENER_NAME, value: "PLAINTEXT" }
+            # Every replication factor must be 1. The defaults are 3, and on a
+            # single broker the internal topics then never become writable —
+            # which surfaces as consumers hanging rather than as an error.
+            - { name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR, value: "1" }
+            - { name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR, value: "1" }
+            - { name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR, value: "1" }
+            - { name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS, value: "0" }
+            # MinIO creates the notification topic on first publish.
+            - { name: KAFKA_AUTO_CREATE_TOPICS_ENABLE, value: "true" }
+            - { name: KAFKA_LOG_DIRS, value: "/var/lib/kafka/data" }
+            # Seven days is far longer than a scanner needs to catch up, and
+            # bounds the volume so a quiet consumer cannot fill it.
+            - { name: KAFKA_LOG_RETENTION_HOURS, value: "168" }
+            - { name: KAFKA_LOG_RETENTION_BYTES, value: "4294967296" }
+          ports:
+            - { containerPort: 9092, name: kafka }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/kafka }
+          readinessProbe:
+            tcpSocket: { port: 9092 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            tcpSocket: { port: 9092 }
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            requests: { cpu: 200m, memory: 768Mi }
+            limits:   { cpu: "2",  memory: 2Gi }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: longhorn
+        resources:
+          requests:
+            storage: 8Gi

@@ -54,3 +54,44 @@ metadata:
 spec:
   selector: { app.kubernetes.io/name: s3nitor-dashboard }
   ports: [{ name: http, port: 80, targetPort: 8081 }]
+---
+# Reachable at s3nitor.th instead of through a port-forward.
+#
+# Matches what the other dashboards in this cluster do: traefik class, plain
+# HTTP on port 80, single-label internal host resolving to 10.12.231.211. There
+# is no ClusterIssuer here, so there is no TLS to attach — adding cert-manager
+# for one dashboard would be a bigger change than this is.
+#
+# Needs a DNS A record: there is no *.th wildcard, every neighbouring host has
+# an explicit record. Without it the Ingress is live and simply never receives a
+# request.
+#
+#     s3nitor.th.  A  10.12.231.211
+#
+# Note what this changes about exposure. A port-forward required kubectl
+# credentials; this does not. The dashboard has no authentication of its own, so
+# anyone who can reach the internal network can read every finding — bucket
+# names, object keys, hashes, and which objects matched. That is the same
+# posture as the dashboards beside it, but the data here is more sensitive than
+# a CVE feed. To gate it, traefik's BasicAuth middleware is the smallest fix:
+# create a secret with an htpasswd line, a Middleware referencing it, and add
+# the traefik.ingress.kubernetes.io/router.middlewares annotation below.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: s3nitor-dashboard
+  labels:
+    app.kubernetes.io/name: s3nitor-dashboard
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: s3nitor.th
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: s3nitor-dashboard
+                port:
+                  number: 80

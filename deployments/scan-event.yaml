@@ -1,0 +1,121 @@
+# s3nitor as a long-running Kafka consumer, rather than the one-shot Job in
+# scan-job.yaml.
+#
+# A Deployment and not a Job because in event mode source.Items() returns a
+# channel that never closes, so pipeline.Run blocks until the context is
+# cancelled. The process is a daemon here; in lister mode it still exits when
+# the bucket has been walked.
+#
+# Requires the MinIO notification target from minio-notify-patch.yaml to be
+# live, and the bucket rule from `mc event add` to point at it. Without those
+# this pod starts, connects to Kafka, and waits forever on an empty topic —
+# which looks healthy and does nothing. That is the failure mode to watch for.
+---
+# The scanner ledger has to outlive the pod. In event mode a restart with an
+# empty DB is not merely slow: scan_tasks is also the dedup key and the retry
+# ledger, so losing it re-publishes everything the consumer group has already
+# committed past. emptyDir was fine for a Job that lived 20 seconds; it is not
+# fine here.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: s3nitor-ledger
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3nitor-event
+  labels: { app: s3nitor-event }
+spec:
+  replicas: 1
+  # RWO volume plus a single-partition topic: two pods would deadlock on the
+  # PVC and gain nothing on the topic. Recreate makes the handover explicit
+  # instead of letting a rollout hang on a volume it cannot mount twice.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: s3nitor-event }
+  template:
+    metadata:
+      labels: { app: s3nitor-event }
+    spec:
+      imagePullSecrets:
+        - name: ghcr
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+      containers:
+        - name: s3scanner
+          # :try, not :latest — `latest` does not exist yet. image.yml
+          # publishes it on pushes to the default branch, and this work is
+          # still on feat/staged-pipeline-foundations. Pulling a tag that was
+          # never pushed fails with `not found`, which reads like an auth
+          # problem but is not: the ghcr secret was working the whole time.
+          image: ghcr.io/luhtaf/s3nitor:try
+          imagePullPolicy: Always
+          env:
+            - { name: DB_DRIVER, value: sqlite3 }
+            - { name: DB_DSN,    value: /ledger/scan.db }
+
+            - { name: S3_ENDPOINT, value: "http://minio:9000" }
+            - { name: S3_BUCKET,   value: "s3nitor-watch" }
+            - { name: AWS_REGION,  value: us-east-1 }
+            - { name: AWS_EC2_METADATA_DISABLED, value: "true" }
+            - name: S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: minio-creds, key: MINIO_ROOT_USER } }
+            - name: S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: minio-creds, key: MINIO_ROOT_PASSWORD } }
+
+            - { name: SOURCE_MODE,     value: event }
+            - { name: EVENT_TRANSPORT, value: kafka }
+            # Pinned, not sniffed. Only the minio decoder is implemented, and
+            # naming it means a wrong payload fails loudly instead of being
+            # guessed at.
+            - { name: EVENT_FORMAT,    value: minio }
+            - { name: KAFKA_BROKERS,   value: "s3nitor-kafka-0.s3nitor-kafka.default.svc.cluster.local:9092" }
+            - { name: KAFKA_TOPIC,     value: "s3nitor-events" }
+            # The consumer group is what makes redelivery work: a pod killed
+            # before it commits sees the same messages again.
+            - { name: KAFKA_GROUP_ID,  value: "s3nitor" }
+
+            - { name: ENABLE_IOC,  value: "true" }
+            - { name: ENABLE_YARA, value: "true" }
+            - { name: ENABLE_OTX,  value: "false" }
+            - { name: ENABLE_VT,   value: "false" }
+
+            - { name: REPORTER_TYPE, value: elasticsearch }
+            - { name: ES_URL,      value: "http://elk-th-new-es-http:9200" }
+            - { name: ES_INDEX,    value: "s3nitor-findings" }
+            - { name: ES_USERNAME, value: "elastic" }
+            - name: ES_PASSWORD
+              valueFrom: { secretKeyRef: { name: elk-th-new-es-elastic-user, key: elastic } }
+
+            # A steady trickle of events does not fill a 100-doc batch, so the
+            # flush interval is what actually publishes here. Kept short so a
+            # test upload shows up in the dashboard while you are still looking
+            # at it, rather than two seconds after you gave up.
+            - { name: PUBLISH_BATCH_SIZE,     value: "20" }
+            - { name: PUBLISH_FLUSH_INTERVAL, value: "2s" }
+
+            - { name: FETCH_BYTE_BUDGET, value: "256MB" }
+            - { name: METRICS_ADDR, value: ":8080" }
+          ports:
+            - { containerPort: 8080, name: metrics }
+          volumeMounts:
+            - { name: ledger, mountPath: /ledger }
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            # Headroom over FETCH_BYTE_BUDGET: the budget bounds bytes in
+            # flight, not total RSS — the SQLite driver is cgo and allocates
+            # outside the Go heap.
+            limits:   { cpu: "2",    memory: "768Mi" }
+      volumes:
+        - name: ledger
+          persistentVolumeClaim:
+            claimName: s3nitor-ledger
