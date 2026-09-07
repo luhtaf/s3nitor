@@ -1,0 +1,83 @@
+# A browser UI for the Kafka topic, at kafka.th.
+#
+# Runs inside the cluster rather than as a desktop client on purpose. A Kafka
+# client does not talk to the address you type: it fetches metadata once, and
+# the broker answers with KAFKA_ADVERTISED_LISTENERS — here the in-cluster FQDN
+# s3nitor-kafka-0.s3nitor-kafka.default.svc.cluster.local:9092. A port-forward
+# therefore connects and then immediately fails on an address the laptop cannot
+# resolve, which is why the desktop route needs an /etc/hosts override that
+# hijacks that name machine-wide. From inside the cluster the advertised address
+# is simply correct, and nothing has to be faked.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-ui
+  labels: { app: kafka-ui }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: kafka-ui }
+  template:
+    metadata:
+      labels: { app: kafka-ui }
+    spec:
+      containers:
+        - name: kafka-ui
+          image: ghcr.io/kafbat/kafka-ui:v1.0.0
+          env:
+            - { name: KAFKA_CLUSTERS_0_NAME, value: "s3nitor" }
+            - { name: KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS,
+                value: "s3nitor-kafka-0.s3nitor-kafka.default.svc.cluster.local:9092" }
+            # Read-only, deliberately. The UI's default lets anyone who opens it
+            # delete topics, reset consumer offsets, and produce messages — and
+            # producing here means injecting events straight into the scanner's
+            # input. There is no authentication in front of this (same as the
+            # other .th dashboards), so write access would mean anyone on the
+            # internal network can make s3nitor scan whatever they like, or
+            # rewind the consumer group and replay the whole topic.
+            - { name: KAFKA_CLUSTERS_0_READONLY, value: "true" }
+            - { name: DYNAMIC_CONFIG_ENABLED, value: "false" }
+          ports:
+            - { containerPort: 8080, name: http }
+          readinessProbe:
+            httpGet: { path: /actuator/health, port: 8080 }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 12
+          resources:
+            requests: { cpu: "100m", memory: "512Mi" }
+            # It is a Spring Boot application; the JVM will happily use whatever
+            # it is given, and 512Mi is where this one starts failing readiness.
+            limits:   { cpu: "1",    memory: "1Gi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-ui
+  labels: { app: kafka-ui }
+spec:
+  selector: { app: kafka-ui }
+  ports:
+    - { port: 80, targetPort: 8080, name: http }
+---
+# Needs the matching A record in the coredns-authoritative ConfigMap, zone db.th:
+#     kafka                   IN  A   10.12.231.211
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kafka-ui
+  labels: { app: kafka-ui }
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: kafka.th
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kafka-ui
+                port:
+                  number: 80
