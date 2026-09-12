@@ -37,11 +37,33 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # One file is the source of truth for the version, so the image tag, the
+      # binary's -X main.Version and the release all agree rather than drifting
+      # into three answers. Bump it with `make bump V=x.y.z`.
+      - id: version
+        name: Read VERSION
+        run: echo "version=$(tr -d ' \n' < VERSION)" >> "$GITHUB_OUTPUT"
+
       - id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          # Three kinds of tag, doing three different jobs:
+          #
+          #   sha-<short>   immutable. The only one that always names exactly
+          #                 one build, and therefore the only one safe to pin a
+          #                 deployment to when it matters which bytes run.
+          #   <version>     from the VERSION file. Moves on every push to main
+          #                 until VERSION is bumped, so it names a release line
+          #                 rather than a build.
+          #   latest        the default branch's newest build. Convenience only.
+          #
+          # `latest` is gated on the default branch: without that, a build from
+          # any feature branch would claim it, and the tag would silently mean
+          # "whichever branch was pushed last".
           tags: |
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -56,7 +78,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VERSION=${{ github.ref_name }}
+            VERSION=${{ steps.version.outputs.version }}
           # amd64 only. The sqlite driver needs cgo, and cross-building it under
           # QEMU for arm64 is slow and fragile; the cluster this runs on is amd64.
           # Add arm64 with a native runner if that changes — not with emulation.

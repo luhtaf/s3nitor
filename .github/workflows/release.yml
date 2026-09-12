@@ -33,6 +33,24 @@ jobs:
           go-version: "1.25"
           cache: true
 
+      # A git tag and the VERSION file are two places the version can live, and
+      # nothing stops them disagreeing. Tagging v0.2.0 against a tree whose
+      # VERSION still says 0.1.0 would publish binaries that print 0.1.0 under a
+      # release called v0.2.0 — wrong in the one place a user checks first, and
+      # invisible until someone reports a bug against a version that was never
+      # built.
+      - name: Tag must match the VERSION file
+        shell: bash
+        run: |
+          set -euo pipefail
+          file="$(tr -d ' \n' < VERSION)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$file" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match VERSION ($file). Run 'make bump V=$tag', commit, then re-tag."
+            exit 1
+          fi
+          echo "VERSION $file matches tag $GITHUB_REF_NAME"
+
       - name: Build
         shell: bash
         env:

@@ -12,7 +12,17 @@ GOGET=$(GOCMD) get
 GOMOD=$(GOCMD) mod
 
 # Build flags
-LDFLAGS=-ldflags "-X main.Version=$(shell git describe --tags --always --dirty)"
+# The VERSION file is the source of truth, not `git describe`. describe reports
+# the nearest tag, so a build from an untagged tree and a build from a release
+# tag disagree about what version they are — and the image, the binary and the
+# release notes then each tell a different story.
+#
+# Local builds append the commit and a -dirty marker, so a binary built from
+# uncommitted changes can never be mistaken for the released one. CI passes the
+# bare version, since it only ever builds committed trees.
+VERSION := $(shell tr -d ' \n' < VERSION)
+GIT_REV := $(shell git describe --always --dirty --match 'NOT-A-TAG' 2>/dev/null)
+LDFLAGS = -ldflags "-X main.Version=$(VERSION)+$(GIT_REV)"
 
 .PHONY: all build clean test deps docker-build docker-run help
 
@@ -106,3 +116,21 @@ help:
 	@echo "  docker-run    - Run Docker container"
 	@echo "  release       - Create release builds"
 	@echo "  help          - Show this help"
+
+# Bump the version. `make bump V=0.2.0`
+#
+# Writes the file and nothing else: no commit, no tag, no push. Releasing is a
+# separate decision from deciding what the next number is, and folding them
+# together means every version bump is also a release whether or not that was
+# intended.
+.PHONY: bump version
+bump:
+	@test -n "$(V)" || { echo "usage: make bump V=0.2.0" >&2; exit 2; }
+	@echo "$(V)" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$$' || { echo "V must be x.y.z, got '$(V)'" >&2; exit 2; }
+	@printf '%s\n' "$(V)" > VERSION
+	@echo "VERSION: $(VERSION) -> $(V)"
+	@echo "next:    git commit -am 'chore: bump to $(V)' && git push"
+	@echo "release: git tag v$(V) && git push origin v$(V)"
+
+version:
+	@echo "$(VERSION)+$(GIT_REV)"
