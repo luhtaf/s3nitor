@@ -52,12 +52,15 @@ spec:
         fsGroup: 1001
       containers:
         - name: s3scanner
-          # :try, not :latest — `latest` does not exist yet. image.yml
-          # publishes it on pushes to the default branch, and this work is
-          # still on feat/staged-pipeline-foundations. Pulling a tag that was
-          # never pushed fails with `not found`, which reads like an auth
-          # problem but is not: the ghcr secret was working the whole time.
-          image: ghcr.io/luhtaf/s3nitor:try
+          # :main, because image.yml never publishes :latest — its tag rules
+          # are type=ref (the branch name), type=sha, and semver on v* tags.
+          # Pulling a tag nothing publishes fails with `not found`, which reads
+          # like an authentication problem and is not.
+          #
+          # A moving tag with imagePullPolicy: Always means a rollout restart
+          # can change the running version without anyone choosing to. Pin
+          # sha-<short> instead when that matters more than convenience.
+          image: ghcr.io/luhtaf/s3nitor:main
           imagePullPolicy: Always
           env:
             - { name: DB_DRIVER, value: sqlite3 }
